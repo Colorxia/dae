@@ -562,6 +562,39 @@ func preserveReloadInterfaceBindings(oldConf, newConf *config.Config) []string {
 	oldLAN := make(map[string]struct{}, len(oldConf.Global.LanInterface))
 	for _, iface := range oldConf.Global.LanInterface {
 		oldLAN[iface] = struct{}{}
+	}
+	oldWAN := make(map[string]struct{}, len(oldConf.Global.WanInterface))
+	for _, iface := range oldConf.Global.WanInterface {
+		oldWAN[iface] = struct{}{}
+	}
+
+	// Dual-role on one NIC (common single-homed gateway: lan=eth0 and wan=eth0)
+	// is intentional: LAN TC serves clients, WAN/cgroup hijacks localhost
+	// (e.g. mosdns DoH). Do not strip that role pair during hot reload —
+	// dropping wan skips setupSkPidMonitor while DetachBpfHooks on the old
+	// generation still tears down cgroup hooks, so localhost stops entering dae.
+	dualRole := make(map[string]struct{})
+	for iface := range oldLAN {
+		if _, ok := oldWAN[iface]; ok {
+			dualRole[iface] = struct{}{}
+		}
+	}
+	for _, iface := range newConf.Global.LanInterface {
+		if contains(newConf.Global.WanInterface, iface) {
+			dualRole[iface] = struct{}{}
+		}
+	}
+
+	for _, iface := range oldConf.Global.LanInterface {
+		if _, keepBoth := dualRole[iface]; keepBoth {
+			if !contains(lan, iface) {
+				lan = append(lan, iface)
+			}
+			if !contains(wan, iface) {
+				wan = append(wan, iface)
+			}
+			continue
+		}
 		changed := !contains(lan, iface) || contains(wan, iface)
 		wan = remove(wan, iface)
 		if !contains(lan, iface) {
@@ -572,6 +605,15 @@ func preserveReloadInterfaceBindings(oldConf, newConf *config.Config) []string {
 		}
 	}
 	for _, iface := range oldConf.Global.WanInterface {
+		if _, keepBoth := dualRole[iface]; keepBoth {
+			if !contains(wan, iface) {
+				wan = append(wan, iface)
+			}
+			if !contains(lan, iface) {
+				lan = append(lan, iface)
+			}
+			continue
+		}
 		if _, isLAN := oldLAN[iface]; isLAN {
 			continue
 		}

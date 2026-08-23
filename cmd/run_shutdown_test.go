@@ -981,6 +981,32 @@ func TestPreserveReloadInterfaceBindingsOnlyAddsDuringHotReload(t *testing.T) {
 	}
 }
 
+// Single-NIC gateway: lan_interface and wan_interface are the same device.
+// Hot reload must keep both roles so setupSkPidMonitor still runs; otherwise
+// DetachBpfHooks on the retiring generation drops cgroup hooks and localhost
+// (mosdns DoH) stops entering dae while LAN clients keep working.
+func TestPreserveReloadInterfaceBindingsKeepsSameNICDualRole(t *testing.T) {
+	oldConf := &config.Config{Global: config.Global{
+		LanInterface: []string{"eth0"},
+		WanInterface: []string{"eth0"},
+	}}
+	newConf := &config.Config{Global: config.Global{
+		LanInterface: []string{"eth0"},
+		WanInterface: []string{"eth0"},
+	}}
+
+	deferred := preserveReloadInterfaceBindings(oldConf, newConf)
+	if len(deferred) != 0 {
+		t.Fatalf("deferred bindings = %v, want none for intentional dual-role eth0", deferred)
+	}
+	if got, want := fmt.Sprint(newConf.Global.LanInterface), "[eth0]"; got != want {
+		t.Fatalf("effective LAN interfaces = %s, want %s", got, want)
+	}
+	if got, want := fmt.Sprint(newConf.Global.WanInterface), "[eth0]"; got != want {
+		t.Fatalf("effective WAN interfaces = %s, want %s", got, want)
+	}
+}
+
 // TestBpfDatapathChangedRoutesPolicyChangesViaStagedHandoff verifies that
 // policy-level config changes (routing rules, fallback, groups, DNS upstream)
 // do NOT trigger a fresh BPF reload. These changes are delivered via BPF map
