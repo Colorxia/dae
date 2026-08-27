@@ -533,7 +533,11 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 		}
 		return true, nil
 	}
-	RecordUploadTraffic(int64(len(data)))
+	// The retained endpoint still belongs to this plane's connection, so
+	// meter it through the plane-bound recorder like every other egress
+	// write: the global recorder would attribute bytes of a retiring
+	// generation to whichever store is published mid-reload.
+	c.recordUploadTraffic(int64(len(data)))
 	if lifecycle, lifecycleOK := newUdpSessionLifecycleContext(ue, ""); lifecycleOK {
 		lifecycle.reportTrafficSuccess()
 	}
@@ -561,7 +565,7 @@ func (c *ControlPlane) prepareUnownedUDPCurrentPolicyFallback(src, dst netip.Add
 	// packets would otherwise be dropped once the cut-over moves the active
 	// epoch away, even though this generation's outbound runtime is still
 	// alive until Close. Closed generations keep the conservative drop path.
-	if c == nil || !c.acceptsRoutingEpochExecutionLocked() {
+	if c == nil || !c.acceptsRoutingEpochExecution() {
 		return nil, false, nil
 	}
 	manager, _ := c.controlPlaneSessionManager()

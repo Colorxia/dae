@@ -7,14 +7,14 @@ require (
 	github.com/antlr/antlr4/runtime/Go/antlr/v4 v4.0.0-20230305170008-8188dc5388df
 	github.com/cilium/ebpf v0.22.0
 	github.com/daeuniverse/dae-config-dist/go/dae_config v0.0.0-20230604120805-1c27619b592d
-	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260825091423-1764decca95b
+	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260827065003-9e1febf4f794
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mholt/archives v0.1.5
 	github.com/miekg/dns v1.1.72
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac
-	github.com/olicesx/quic-go v0.0.0-20260825091419-801d72b1bfff
+	github.com/olicesx/quic-go v0.0.0-20260827105826-c61845789995
 	github.com/panjf2000/ants/v2 v2.11.5
 	github.com/safchain/ethtool v0.7.0
 	github.com/shirou/gopsutil/v4 v4.26.1
@@ -118,11 +118,11 @@ require (
 // Add on a full send queue (30s timeout -> ErrDatagramQueueFullTimeout).
 // The current revision preserves package Dial's skip-address fast path while
 // restoring sender addresses for explicit transports.
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260825091419-801d72b1bfff
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260827105826-c61845789995
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
 
-// Use the remote outbound fork containing hot-path buffer reuse, underlay-
-// first Close, and honest WriteBatch n on top of the HY2/quic-go pins.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260827012226-e030f04c3bb1
+// Remote outbound fork: Trojan UDP CRLF, sticky role-header dispatch,
+// scoped h2 MarkDead, 8KiB direct small-tier, and TUIC stream-parse bench.
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260827081812-6b6531ef9eb4
