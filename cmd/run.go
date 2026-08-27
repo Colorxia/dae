@@ -171,6 +171,24 @@ type stagedReloadHandoff struct {
 	provisionalOwner      bool
 }
 
+// newStagedReloadHandoff builds the base handoff from the two supervisor
+// generations; path-specific flags (freshDatapath, preparedDNSHandoff,
+// bpfTransferred, ...) are set by the caller.
+func newStagedReloadHandoff(active, candidate *runtimeGeneration, abortConnections, hasOverlap bool) *stagedReloadHandoff {
+	return &stagedReloadHandoff{
+		preparedGeneration: candidate,
+		oldControlPlane:    active.controlPlane,
+		oldCancel:          active.cancel,
+		oldConf:            active.conf,
+		oldListener:        active.listener,
+		newControlPlane:    candidate.controlPlane,
+		newCancel:          candidate.cancel,
+		newListener:        candidate.listener,
+		abortConnections:   abortConnections,
+		hasOverlap:         hasOverlap,
+	}
+}
+
 var setRunSignalProgress = func(code byte, content string) error {
 	return writeSignalProgressFile(SignalProgressFilePath, code, content)
 }
@@ -246,6 +264,43 @@ var (
 		},
 	}
 )
+
+// restorePreviousFreshDatapathGeneration rolls a failed fresh-datapath reload
+// back to the previous generation: fresh-handoff rollback, supervisor slot
+// restore, and a serve-goroutine restart when the cutover had stopped the old
+// listener. step labels the failure context in logs and wrapped errors; the
+// caller fails the reload attempt on a non-nil return.
+func restorePreviousFreshDatapathGeneration(
+	w *reloadWorker,
+	sigs <-chan os.Signal,
+	runStateChanges chan struct{},
+	supervisor *runtimeSupervisor,
+	handoff *stagedReloadHandoff,
+	step string,
+) error {
+	recoveredListener, rollbackErr := rollbackFreshDatapathReloadHandoff(w.log, handoff)
+	if rollbackErr != nil {
+		w.log.WithError(rollbackErr).Errorf("[Reload] Failed to recover previous generation %s", step)
+		return fmt.Errorf("recover previous generation %s: %w", step, rollbackErr)
+	}
+	w.listener = recoveredListener
+	if err := supervisor.replaceActive(&runtimeGeneration{
+		controlPlane: handoff.oldControlPlane,
+		listener:     recoveredListener,
+		cancel:       handoff.oldCancel,
+		conf:         handoff.oldConf,
+	}); err != nil {
+		w.log.WithError(err).Errorf("[Reload] Failed to restore supervisor %s", step)
+		return fmt.Errorf("restore supervisor %s: %w", step, err)
+	}
+	if handoff.oldRuntimeStopped {
+		if restartErr := restartRecoveredControlPlane(w.log, sigs, runStateChanges, handoff.oldControlPlane, w.listener); restartErr != nil {
+			w.log.WithError(restartErr).Errorf("[Reload] Failed to restart previous listener generation %s", step)
+			return fmt.Errorf("restart previous generation %s: %w", step, restartErr)
+		}
+	}
+	return nil
+}
 
 func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (err error) {
 	return newRunner(log, conf, externGeoDataDirs).Run()
@@ -478,29 +533,9 @@ loop:
 							}
 						}
 						if handoff.freshDatapath && handoff.freshCutoverStarted {
-							recoveredListener, rollbackErr := rollbackFreshDatapathReloadHandoff(w.log, handoff)
-							if rollbackErr != nil {
-								w.log.WithError(rollbackErr).Errorln("[Reload] Failed to recover previous generation from malformed fresh handoff")
-								failRun(errors.Join(reloadErr, fmt.Errorf("recover malformed fresh handoff: %w", rollbackErr)))
+							if restoreErr := restorePreviousFreshDatapathGeneration(w, sigs, runStateChanges, runtimeSupervisor, handoff, "from malformed fresh handoff"); restoreErr != nil {
+								failRun(errors.Join(reloadErr, restoreErr))
 								break loop
-							}
-							w.listener = recoveredListener
-							if err := runtimeSupervisor.replaceActive(&runtimeGeneration{
-								controlPlane: handoff.oldControlPlane,
-								listener:     recoveredListener,
-								cancel:       handoff.oldCancel,
-								conf:         handoff.oldConf,
-							}); err != nil {
-								w.log.WithError(err).Errorln("[Reload] Failed to restore supervisor from malformed fresh handoff")
-								failRun(errors.Join(reloadErr, fmt.Errorf("restore supervisor from malformed fresh handoff: %w", err)))
-								break loop
-							}
-							if handoff.oldRuntimeStopped {
-								if restartErr := restartRecoveredControlPlane(w.log, sigs, runStateChanges, handoff.oldControlPlane, w.listener); restartErr != nil {
-									w.log.WithError(restartErr).Errorln("[Reload] Failed to restart previous generation from malformed fresh handoff")
-									failRun(errors.Join(reloadErr, fmt.Errorf("restart previous generation from malformed fresh handoff: %w", restartErr)))
-									break loop
-								}
 							}
 						} else {
 							if restoreErr := restoreStagedReloadHandoff(w.log, handoff); restoreErr != nil {
@@ -528,31 +563,11 @@ loop:
 						w.log.WithError(reloadErr).Errorln("[Reload] Fresh datapath cutover failed; restoring previous generation")
 
 						runtimeSupervisor.rollbackPrepared(handoff.preparedGeneration)
-						recoveredListener, rollbackErr := rollbackFreshDatapathReloadHandoff(w.log, handoff)
-						if rollbackErr != nil {
-							w.log.WithError(rollbackErr).Errorln("[Reload] Failed to recover previous generation after cutover error")
-							failRun(errors.Join(reloadErr, fmt.Errorf("recover previous generation after cutover error: %w", rollbackErr)))
-							break loop
-						}
-						w.listener = recoveredListener
-						if err := runtimeSupervisor.replaceActive(&runtimeGeneration{
-							controlPlane: handoff.oldControlPlane,
-							listener:     recoveredListener,
-							cancel:       handoff.oldCancel,
-							conf:         handoff.oldConf,
-						}); err != nil {
-							w.log.WithError(err).Errorln("[Reload] Failed to restore supervisor after fresh datapath rollback")
-							failRun(errors.Join(reloadErr, fmt.Errorf("restore supervisor after fresh datapath rollback: %w", err)))
+						if restoreErr := restorePreviousFreshDatapathGeneration(w, sigs, runStateChanges, runtimeSupervisor, handoff, "after cutover error"); restoreErr != nil {
+							failRun(errors.Join(reloadErr, restoreErr))
 							break loop
 						}
 						reloadManager.clearPendingStagedHandoff()
-						if handoff.oldRuntimeStopped {
-							if restartErr := restartRecoveredControlPlane(w.log, sigs, runStateChanges, handoff.oldControlPlane, w.listener); restartErr != nil {
-								w.log.WithError(restartErr).Errorln("[Reload] Failed to restart previous listener generation after cutover rollback")
-								failRun(errors.Join(reloadErr, fmt.Errorf("restart previous generation after cutover rollback: %w", restartErr)))
-								break loop
-							}
-						}
 						reloadManager.finishReloadFailure()
 						continue
 					}
@@ -607,30 +622,9 @@ loop:
 					if handoff := reloadManager.currentPendingStagedHandoff(); handoff != nil {
 						runtimeSupervisor.rollbackPrepared(handoff.preparedGeneration)
 						if handoff.freshDatapath {
-							recoveredListener, rollbackErr := rollbackFreshDatapathReloadHandoff(w.log, handoff)
-							if rollbackErr != nil {
-								w.log.WithError(rollbackErr).Errorln("[Reload] Failed to recover previous generation after fresh datapath handoff failure")
-								failRun(errors.Join(reloadErr, fmt.Errorf("recover previous generation after fresh datapath handoff failure: %w", rollbackErr)))
+							if restoreErr := restorePreviousFreshDatapathGeneration(w, sigs, runStateChanges, runtimeSupervisor, handoff, "after fresh datapath handoff failure"); restoreErr != nil {
+								failRun(errors.Join(reloadErr, restoreErr))
 								break loop
-							}
-							w.listener = recoveredListener
-							if err := runtimeSupervisor.replaceActive(&runtimeGeneration{
-								controlPlane: handoff.oldControlPlane,
-								listener:     recoveredListener,
-								cancel:       handoff.oldCancel,
-								conf:         handoff.oldConf,
-							}); err != nil {
-								w.log.WithError(err).Errorln("[Reload] Failed to restore supervisor after fresh datapath rollback")
-								failRun(errors.Join(reloadErr, fmt.Errorf("restore supervisor after fresh datapath rollback: %w", err)))
-								break loop
-							}
-							reloadManager.clearPendingStagedHandoff()
-							if handoff.oldRuntimeStopped {
-								if restartErr := restartRecoveredControlPlane(w.log, sigs, runStateChanges, handoff.oldControlPlane, w.listener); restartErr != nil {
-									w.log.WithError(restartErr).Errorln("[Reload] Failed to restart previous listener generation after rollback")
-									failRun(errors.Join(reloadErr, fmt.Errorf("restart previous generation after fresh datapath rollback: %w", restartErr)))
-									break loop
-								}
 							}
 						} else {
 							reloadManager.clearPendingStagedHandoff()
@@ -643,6 +637,7 @@ loop:
 							w.log.Warnln("[Reload] Restored previous listener generation after staged handoff failure")
 						}
 					}
+					reloadManager.clearPendingStagedHandoff()
 					reloadManager.finishReloadFailure()
 					continue
 				}
@@ -685,29 +680,9 @@ loop:
 						w.log.WithError(reloadErr).Errorln("[Reload] Failed to publish staged reload candidate; keeping current generation active")
 						runtimeSupervisor.rollbackPrepared(handoff.preparedGeneration)
 						if handoff.freshDatapath {
-							recoveredListener, rollbackErr := rollbackFreshDatapathReloadHandoff(w.log, handoff)
-							if rollbackErr != nil {
-								w.log.WithError(rollbackErr).Errorln("[Reload] Failed to recover previous generation after publish error")
-								failRun(errors.Join(reloadErr, fmt.Errorf("recover previous generation after publish error: %w", rollbackErr)))
+							if restoreErr := restorePreviousFreshDatapathGeneration(w, sigs, runStateChanges, runtimeSupervisor, handoff, "after publish error"); restoreErr != nil {
+								failRun(errors.Join(reloadErr, restoreErr))
 								break loop
-							}
-							w.listener = recoveredListener
-							if err := runtimeSupervisor.replaceActive(&runtimeGeneration{
-								controlPlane: handoff.oldControlPlane,
-								listener:     recoveredListener,
-								cancel:       handoff.oldCancel,
-								conf:         handoff.oldConf,
-							}); err != nil {
-								w.log.WithError(err).Errorln("[Reload] Failed to restore supervisor after publish error")
-								failRun(errors.Join(reloadErr, fmt.Errorf("restore supervisor after publish error: %w", err)))
-								break loop
-							}
-							if handoff.oldRuntimeStopped {
-								if restartErr := restartRecoveredControlPlane(w.log, sigs, runStateChanges, handoff.oldControlPlane, w.listener); restartErr != nil {
-									w.log.WithError(restartErr).Errorln("[Reload] Failed to restart previous listener generation after publish error")
-									failRun(errors.Join(reloadErr, fmt.Errorf("restart previous generation after publish error: %w", restartErr)))
-									break loop
-								}
 							}
 						} else {
 							if restoreErr := restoreStagedReloadHandoff(w.log, handoff); restoreErr != nil {

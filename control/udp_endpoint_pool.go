@@ -22,7 +22,6 @@ import (
 )
 
 var (
-	UdpRoutingResultCacheTtl      = 300 * time.Millisecond
 	ErrEndpointFailed             = fmt.Errorf("endpoint creation recently failed (negative cache)")
 	errUdpEndpointAdmissionClosed = stderrors.New("udp endpoint admission closed")
 )
@@ -108,13 +107,12 @@ type UdpEndpoint struct {
 	pendingReplyPeerCount int
 	pendingReplyPeerNext  int
 
-	Dialer             *dialer.Dialer
-	Outbound           *outbound.DialerGroup
-	flowRouteBinding   UdpRouteBinding
-	flowNetwork        string
-	flowEgressOverride *UdpEgressBinding
-	flowBindingSet     bool
-	flowBindingDialIP  bool
+	Dialer            *dialer.Dialer
+	Outbound          *outbound.DialerGroup
+	flowRouteBinding  UdpRouteBinding
+	flowNetwork       string
+	flowBindingSet    bool
+	flowBindingDialIP bool
 
 	// Non-empty indicates this UDP Endpoint is related with a sniffed domain.
 	SniffedDomain string
@@ -123,7 +121,6 @@ type UdpEndpoint struct {
 	routingMu         sync.RWMutex
 	routingCacheDst   netip.AddrPort
 	routingCacheProto uint8
-	routingCacheAt    time.Time
 	routingCache      bpfRoutingResult
 	hasRoutingCache   bool
 
@@ -183,6 +180,10 @@ type UdpEndpoint struct {
 	sessionRuntime *UDPFlowRuntime
 }
 
+// UdpEndpointKey is the pool key. Dst=0 for Full-Cone NAT, non-zero for
+// destination-affine flows such as QUIC or userspace-routed UDP. RouteScope is
+// only populated when UDP routing depends on packet metadata that userspace
+// cannot safely infer from payload reuse alone.
 type UdpEndpointKey struct {
 	Src        netip.AddrPort
 	Dst        netip.AddrPort
@@ -319,12 +320,6 @@ func (p *UdpEndpointPool) Len() int {
 		shard.mu.RUnlock()
 	}
 	return total
-}
-
-// Count returns the number of active UDP endpoints in the pool.
-// It is an alias for Len() and is provided for backward compatibility.
-func (p *UdpEndpointPool) Count() int {
-	return p.Len()
 }
 
 func normalizeUdpEndpointPoolNetworkType(networkType dialer.NetworkType) dialer.NetworkType {
@@ -598,7 +593,14 @@ func (p *UdpEndpointPool) Remove(key UdpEndpointKey, udpEndpoint *UdpEndpoint) (
 	return nil
 }
 
+// udpEndpointPoolGetObserver, when non-nil, is invoked on every Get. Tests
+// use it to count per-packet pool lookups; production leaves it nil.
+var udpEndpointPoolGetObserver func(UdpEndpointKey)
+
 func (p *UdpEndpointPool) Get(key UdpEndpointKey) (udpEndpoint *UdpEndpoint, ok bool) {
+	if observe := udpEndpointPoolGetObserver; observe != nil {
+		observe(key)
+	}
 	shard := p.shardFor(key)
 	shard.mu.RLock()
 	defer shard.mu.RUnlock()
@@ -709,12 +711,13 @@ dialSuccess:
 	if _, ok := packetConn.(netproxy.PacketBatchWriter); ok {
 		ue.writeBatch = newUDPWriteBatchAggregator(ue)
 	}
-	ue.setFlowBinding(dialOption.Binding)
 	if createOption.sessionManager != nil {
 		if _, err := createOption.sessionManager.adoptUDP(ue, dialOption.Binding, createOption.egressRuntime); err != nil {
 			_ = packetConn.Close()
 			return nil, err
 		}
+	} else {
+		ue.setFlowBinding(dialOption.Binding)
 	}
 	if createOption.DrainTracker != nil {
 		ue.drainRelease = createOption.DrainTracker.Acquire()
@@ -806,6 +809,43 @@ func (p *UdpEndpointPool) cacheFailureLocked(key UdpEndpointKey, log *logrus.Log
 	shard.mu.Unlock()
 }
 
+// udpEndpointHitClass classifies an endpoint found by GetOrCreate.
+type udpEndpointHitClass int
+
+const (
+	udpEndpointHitUsable udpEndpointHitClass = iota
+	udpEndpointHitFailed
+	udpEndpointHitStale
+)
+
+// classifyUdpEndpointHit applies the shared existing-endpoint policy: usable
+// entries get their TTL/NAT timeout refreshed in place; fresh failures are
+// hard errors; expired failures, dead and generation-stale entries are stale
+// and eligible for replacement. Callers hold the shard lock appropriate to
+// their path.
+func (p *UdpEndpointPool) classifyUdpEndpointHit(ue *UdpEndpoint, createOption *UdpEndpointOptions) udpEndpointHitClass {
+	switch {
+	case ue.failed.Load():
+		if !ue.IsExpired(time.Now().UnixNano()) {
+			return udpEndpointHitFailed
+		}
+		return udpEndpointHitStale
+	case ue.IsDead() || (!p.endpointGenerationCurrent(ue) && !p.endpointSurvivesDialerInvalidation(ue)):
+		return udpEndpointHitStale
+	default:
+		if createOption != nil && createOption.NatTimeout > 0 {
+			ue.UpdateNatTimeout(effectiveUdpEndpointNatTimeout(ue.Dialer, createOption.NatTimeout))
+		} else {
+			var nowNano int64
+			if createOption != nil {
+				nowNano = createOption.NowNano
+			}
+			ue.RefreshTtlWithTime(nowNano)
+		}
+		return udpEndpointHitUsable
+	}
+}
+
 func (p *UdpEndpointPool) GetOrCreate(key UdpEndpointKey, createOption *UdpEndpointOptions) (udpEndpoint *UdpEndpoint, isNew bool, err error) {
 	var admissionGate *udpEndpointAdmissionGate
 	if createOption != nil {
@@ -822,29 +862,15 @@ func (p *UdpEndpointPool) GetOrCreate(key UdpEndpointKey, createOption *UdpEndpo
 	shard.mu.RLock()
 	ue, ok := shard.pool[key]
 	if ok {
-		switch {
-		case ue.failed.Load():
-			if !ue.IsExpired(time.Now().UnixNano()) {
-				shard.mu.RUnlock()
-				return nil, false, ErrEndpointFailed
-			}
-			// Expired failure entry — fall through to lock and replace.
-		case ue.IsDead() || (!p.endpointGenerationCurrent(ue) && !p.endpointSurvivesDialerInvalidation(ue)):
-		// Expired dead entry — fall through to lock and replace.
-		default:
-			// Update NAT timeout based on current forwarding state
-			if createOption != nil && createOption.NatTimeout > 0 {
-				ue.UpdateNatTimeout(effectiveUdpEndpointNatTimeout(ue.Dialer, createOption.NatTimeout))
-			} else {
-				var nowNano int64
-				if createOption != nil {
-					nowNano = createOption.NowNano
-				}
-				ue.RefreshTtlWithTime(nowNano)
-			}
+		switch p.classifyUdpEndpointHit(ue, createOption) {
+		case udpEndpointHitFailed:
+			shard.mu.RUnlock()
+			return nil, false, ErrEndpointFailed
+		case udpEndpointHitUsable:
 			shard.mu.RUnlock()
 			return ue, false, nil
 		}
+		// Stale entry — fall through to the write-locked path for replacement.
 	}
 	shard.mu.RUnlock()
 
@@ -856,29 +882,16 @@ func (p *UdpEndpointPool) GetOrCreate(key UdpEndpointKey, createOption *UdpEndpo
 	shard.mu.Lock()
 	ue, ok = shard.pool[key]
 	if ok {
-		switch {
-		case ue.failed.Load():
-			if !ue.IsExpired(time.Now().UnixNano()) {
-				shard.mu.Unlock()
-				return nil, false, ErrEndpointFailed
-			}
-			delete(shard.pool, key)
-			staleToClose = ue
-		case ue.IsDead() || (!p.endpointGenerationCurrent(ue) && !p.endpointSurvivesDialerInvalidation(ue)):
-			delete(shard.pool, key)
-			staleToClose = ue
-		default:
-			if createOption != nil && createOption.NatTimeout > 0 {
-				ue.UpdateNatTimeout(effectiveUdpEndpointNatTimeout(ue.Dialer, createOption.NatTimeout))
-			} else {
-				var nowNano int64
-				if createOption != nil {
-					nowNano = createOption.NowNano
-				}
-				ue.RefreshTtlWithTime(nowNano)
-			}
+		switch p.classifyUdpEndpointHit(ue, createOption) {
+		case udpEndpointHitFailed:
+			shard.mu.Unlock()
+			return nil, false, ErrEndpointFailed
+		case udpEndpointHitUsable:
 			shard.mu.Unlock()
 			return ue, false, nil
+		default:
+			delete(shard.pool, key)
+			staleToClose = ue
 		}
 	}
 	shard.mu.Unlock()

@@ -37,24 +37,25 @@ func sameUdpConnStateOwner(left, right udpConnStateOwner) bool {
 	return left == right
 }
 
-// FlowBinding returns the immutable route and egress selections made when the endpoint was created.
+// FlowBinding returns the immutable route and egress selections made when the
+// endpoint was created. Production code reads only Route.Mark (via
+// replySoMark); the full binding is a verification surface for tests.
 func (ue *UdpEndpoint) FlowBinding() UdpFlowBinding {
 	if ue == nil || !ue.flowBindingSet {
 		return UdpFlowBinding{}
 	}
-	egress := UdpEgressBinding{
-		Dialer:        ue.Dialer,
-		Outbound:      ue.Outbound,
-		Target:        ue.DialTarget,
-		Network:       ue.flowNetwork,
-		NetworkType:   ue.endpointNetworkType,
-		SniffedDomain: ue.SniffedDomain,
-		IsDialIp:      ue.flowBindingDialIP,
+	return UdpFlowBinding{
+		Route: ue.flowRouteBinding,
+		Egress: UdpEgressBinding{
+			Dialer:        ue.Dialer,
+			Outbound:      ue.Outbound,
+			Target:        ue.DialTarget,
+			Network:       ue.flowNetwork,
+			NetworkType:   ue.endpointNetworkType,
+			SniffedDomain: ue.SniffedDomain,
+			IsDialIp:      ue.flowBindingDialIP,
+		},
 	}
-	if ue.flowEgressOverride != nil {
-		egress = *ue.flowEgressOverride
-	}
-	return UdpFlowBinding{Route: ue.flowRouteBinding, Egress: egress}
 }
 
 func (ue *UdpEndpoint) replySoMark() uint32 {
@@ -72,10 +73,6 @@ func (ue *UdpEndpoint) setFlowBinding(binding UdpFlowBinding) {
 	ue.flowNetwork = binding.Egress.Network
 	ue.flowBindingDialIP = binding.Egress.IsDialIp
 	ue.flowBindingSet = true
-	if got := ue.FlowBinding().Egress; got != binding.Egress {
-		override := binding.Egress
-		ue.flowEgressOverride = &override
-	}
 }
 
 func (ue *UdpEndpoint) TrackUdpConnStateTuplePair(src, dst netip.AddrPort) {
@@ -919,50 +916,18 @@ func (ue *UdpEndpoint) GetBoundRoutingResult(dst netip.AddrPort, l4proto uint8) 
 	return &result, true
 }
 
-func (ue *UdpEndpoint) GetCachedRoutingResult(dst netip.AddrPort, l4proto uint8) (*bpfRoutingResult, bool) {
-	ttl := UdpRoutingResultCacheTtl
-	if ttl <= 0 {
-		return nil, false
-	}
-
-	ue.routingMu.RLock()
-	defer ue.routingMu.RUnlock()
-
-	if !ue.hasRoutingCache {
-		return nil, false
-	}
-	if ue.routingCacheProto != l4proto || ue.routingCacheDst != dst {
-		return nil, false
-	}
-	if time.Since(ue.routingCacheAt) > ttl {
-		return nil, false
-	}
-
-	result := ue.routingCache
-	return &result, true
-}
-
 func (ue *UdpEndpoint) UpdateCachedRoutingResult(dst netip.AddrPort, l4proto uint8, result *bpfRoutingResult) {
 	if result == nil {
-		return
-	}
-	if UdpRoutingResultCacheTtl <= 0 {
 		return
 	}
 
 	ue.routingMu.Lock()
 	ue.routingCacheDst = dst
 	ue.routingCacheProto = l4proto
-	ue.routingCacheAt = time.Now()
 	ue.routingCache = *result
 	ue.hasRoutingCache = true
 	ue.routingMu.Unlock()
 }
-
-// UdpEndpointKey is the pool key. Dst=0 for Full-Cone NAT, non-zero for
-// destination-affine flows such as QUIC or userspace-routed UDP. RouteScope is
-// only populated when UDP routing depends on packet metadata that userspace
-// cannot safely infer from payload reuse alone.
 
 // endpointSurvivesDialerInvalidation reports whether an endpoint should remain
 // reusable after its dialer transitions to not alive.

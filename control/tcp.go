@@ -236,7 +236,7 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 				lRelayConn = probeConn
 			default:
 				// ConnSniffer should be used later, so we cannot close it now.
-				sniffer := sniffing.NewConnSniffer(probeConn, c.sniffingTimeout)
+				sniffer := sniffing.NewConnSniffer(probeConn, c.sniffingTimeout, c.log)
 				defer func() { _ = sniffer.Close() }()
 				lRelayConn = sniffer
 
@@ -658,12 +658,12 @@ func (c *bufioConn) TakeRelayPrefix() []byte {
 	return prefix
 }
 
-func (c *bufioConn) CopyRelayRemainder(dst io.Writer, buf []byte, record func(int64)) (int64, error) {
+func (c *bufioConn) CopyRelayRemainder(dst io.Writer, buf []byte, record func(int64), onActive func(int64)) (int64, error) {
 	if c == nil {
 		return 0, nil
 	}
 	if c.reader == nil {
-		return relayCopyDirect(dst, c.Conn, buf, record, nil)
+		return relayCopyDirect(dst, c.Conn, buf, record, onActive)
 	}
 
 	// Once buffered bytes are drained we can resume directly on the underlying
@@ -715,15 +715,6 @@ func (c *bufioConn) SetReadDeadline(t time.Time) error {
 
 func (c *bufioConn) SetWriteDeadline(t time.Time) error {
 	return c.Conn.SetWriteDeadline(t)
-}
-
-// handleTCPDnsFastPath handles DNS-over-TCP transparent proxy.
-// It reads DNS queries from the connection, processes them through the DNS controller,
-// and writes responses back. Returns true if the connection was handled as DNS.
-// Uses bufio.Reader to support peeking at data without consuming it,
-// allowing proper fallback to normal TCP handling if this isn't DNS traffic.
-func (c *ControlPlane) handleTCPDnsFastPath(ctx context.Context, lConn net.Conn, bufReader *bufio.Reader, src, dst netip.AddrPort, routingResult *bpfRoutingResult) (handled bool, err error) {
-	return c.handleTCPDnsFastPathOwned(ctx, lConn, bufReader, src, dst, routingResult, nil)
 }
 
 func (c *ControlPlane) handleTCPDnsFastPathOwned(
