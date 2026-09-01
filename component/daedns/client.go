@@ -24,7 +24,6 @@ import (
 	"github.com/daeuniverse/dae/component/dnstransport"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pkg/fastrand"
-	"github.com/daeuniverse/outbound/protocol/direct"
 	tc "github.com/daeuniverse/outbound/protocol/tuic/common"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/olicesx/quic-go"
@@ -36,7 +35,12 @@ var errPassthroughToBaseResolver = errors.New("dns request routing selected pass
 var udpDNSBufPool = sync.Pool{
 	// Keep the full UDP DNS payload budget so oversized replies still unpack
 	// correctly instead of failing before TCP fallback decisions are made.
-	New: func() any { return make([]byte, 65535) },
+	// Buffers are stored as *[]byte so Put hands the pool a pointer instead
+	// of boxing the slice header on every Put (SA6002).
+	New: func() any {
+		buf := make([]byte, 65535)
+		return &buf
+	},
 }
 
 const lookupSharedTimeout = 10 * time.Second
@@ -246,9 +250,9 @@ func (r *Router) lookupType(ctx context.Context, upstream *componentdns.Upstream
 	// r.exchange consumes data synchronously across every scheme
 	// (queryUDP writes inline; queryTCP/TLS/QUIC/HTTPS copy data before use),
 	// so recycling buf after exchange returns is safe.
-	poolBuf := udpDNSBufPool.Get().([]byte)
-	defer udpDNSBufPool.Put(poolBuf) //nolint:staticcheck
-	data, err := msg.PackBuffer(poolBuf[:cap(poolBuf)])
+	poolBuf := udpDNSBufPool.Get().(*[]byte)
+	defer udpDNSBufPool.Put(poolBuf)
+	data, err := msg.PackBuffer((*poolBuf)[:cap(*poolBuf)])
 	if err != nil {
 		return nil, err
 	}
@@ -332,7 +336,7 @@ func (r *Router) exchangeTarget(ctx context.Context, upstream *componentdns.Upst
 }
 
 func (r *Router) queryUDP(ctx context.Context, target netip.AddrPort, data []byte) (*dnsmessage.Msg, error) {
-	conn, err := direct.SymmetricDirect.DialContext(ctx, common.MagicNetwork("udp", r.soMark, r.mptcp), target.String())
+	conn, err := r.directDialer.DialContext(ctx, common.MagicNetwork("udp", r.soMark, r.mptcp), target.String())
 	if err != nil {
 		return nil, err
 	}
@@ -346,8 +350,9 @@ func (r *Router) queryUDP(ctx context.Context, target netip.AddrPort, data []byt
 	if _, err = netutils.WriteUDPConn(conn, target.String(), data); err != nil {
 		return nil, err
 	}
-	buf := udpDNSBufPool.Get().([]byte)
-	defer udpDNSBufPool.Put(buf) //nolint:staticcheck
+	bufPtr := udpDNSBufPool.Get().(*[]byte)
+	defer udpDNSBufPool.Put(bufPtr)
+	buf := *bufPtr
 	for range 8 {
 		n, readErr := netutils.ReadUDPConn(conn, buf)
 		if readErr != nil {
@@ -369,7 +374,7 @@ func (r *Router) queryUDP(ctx context.Context, target netip.AddrPort, data []byt
 }
 
 func (r *Router) queryTCP(ctx context.Context, target netip.AddrPort, data []byte) (*dnsmessage.Msg, error) {
-	conn, err := direct.SymmetricDirect.DialContext(ctx, common.MagicNetwork("tcp", r.soMark, r.mptcp), target.String())
+	conn, err := r.directDialer.DialContext(ctx, common.MagicNetwork("tcp", r.soMark, r.mptcp), target.String())
 	if err != nil {
 		return nil, err
 	}
@@ -382,7 +387,7 @@ func (r *Router) queryTCP(ctx context.Context, target netip.AddrPort, data []byt
 }
 
 func (r *Router) queryTLS(ctx context.Context, upstream *componentdns.Upstream, target netip.AddrPort, data []byte) (*dnsmessage.Msg, error) {
-	conn, err := direct.SymmetricDirect.DialContext(ctx, common.MagicNetwork("tcp", r.soMark, r.mptcp), target.String())
+	conn, err := r.directDialer.DialContext(ctx, common.MagicNetwork("tcp", r.soMark, r.mptcp), target.String())
 	if err != nil {
 		return nil, err
 	}
@@ -435,13 +440,13 @@ func (r *Router) newHTTPTransport(upstream *componentdns.Upstream, target netip.
 	if http3Mode {
 		return dnstransport.NewHTTP3Transport(upstream.Hostname, func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
 			return dnstransport.DialEarlyOwned(ctx, func(ctx context.Context) (netproxy.Conn, error) {
-				return direct.SymmetricDirect.DialContext(ctx, common.MagicNetwork("udp", r.soMark, r.mptcp), target.String())
+				return r.directDialer.DialContext(ctx, common.MagicNetwork("udp", r.soMark, r.mptcp), target.String())
 			}, target, tlsCfg, cfg)
 		})
 	}
 
 	return dnstransport.NewHTTPTransport(upstream.Hostname, func(ctx context.Context, _, _ string) (net.Conn, error) {
-		conn, err := direct.SymmetricDirect.DialContext(ctx, common.MagicNetwork("tcp", r.soMark, r.mptcp), target.String())
+		conn, err := r.directDialer.DialContext(ctx, common.MagicNetwork("tcp", r.soMark, r.mptcp), target.String())
 		if err != nil {
 			return nil, err
 		}
@@ -450,7 +455,7 @@ func (r *Router) newHTTPTransport(upstream *componentdns.Upstream, target netip.
 }
 
 func (r *Router) queryQUIC(ctx context.Context, upstream *componentdns.Upstream, target netip.AddrPort, data []byte) (*dnsmessage.Msg, error) {
-	conn, err := direct.SymmetricDirect.DialContext(ctx, common.MagicNetwork("udp", r.soMark, r.mptcp), target.String())
+	conn, err := r.directDialer.DialContext(ctx, common.MagicNetwork("udp", r.soMark, r.mptcp), target.String())
 	if err != nil {
 		return nil, err
 	}

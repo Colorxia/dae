@@ -152,7 +152,7 @@ func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn, ownership
 				}).WithError(err).Debug("Routing tuple missing; fallback to userspace routing")
 			}
 		} else {
-			return fmt.Errorf("failed to retrieve target info %v: %v", dst.String(), err)
+			return fmt.Errorf("failed to retrieve target info %v: %w", dst.String(), err)
 		}
 	}
 	owner, ownerErr := c.routingEpochExecutionOwner(routingResult)
@@ -290,10 +290,12 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 		}
 		return fmt.Errorf("failed to dial %v: %w", dst, err)
 	}
+	if ownership != nil {
+		ownership.storePendingEgress(rConn)
+	}
 	binding := newTcpFlowBinding(c.PolicyEpoch(), res)
 	flow, err := c.adoptTCPFlow(ctx, ownership, ingressConn, rConn, binding, src, dst)
 	if err != nil {
-		_ = rConn.Close()
 		if stderrors.Is(err, ErrSessionManagerClosed) || stderrors.Is(err, errRoutingEpochOwnerUnavailable) {
 			return nil
 		}
@@ -418,6 +420,22 @@ func (p *RouteDialParam) toProxyDialParam() *proxyDialParam {
 
 type WriteCloser interface {
 	CloseWrite() error
+}
+
+// closeWriteRelayConn half-closes the write side of a relay destination.
+// Wrappers used on the sniff / DNS-probe path embed net.Conn and therefore
+// hide *net.TCPConn.CloseWrite; peel them with the same unwrap used by splice.
+func closeWriteRelayConn(conn netproxy.Conn) {
+	if conn == nil {
+		return
+	}
+	if tcp, ok := unwrapRelayTCPConn(conn); ok {
+		_ = tcp.CloseWrite()
+		return
+	}
+	if wc, ok := conn.(WriteCloser); ok {
+		_ = wc.CloseWrite()
+	}
 }
 
 // RelayTCPContextWithRecords copies data bidirectionally between two

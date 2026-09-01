@@ -212,15 +212,9 @@ func (c *ControlPlane) CommitPreparedDatapath() error {
 	}
 	if c.routingKernspaceSnapshot != nil {
 		c.log.Infoln("Loading routing rules into kernel space (BPF)...")
-		lpmIndices, err := c.routingKernspaceSnapshot.BuildKernspaceForSlot(
-			c.log,
-			c.core.bpf.Load(),
-			c.core.RoutingEpochSlot(),
-		)
-		if err != nil {
+		if _, err := c.core.buildRoutingKernspaceForSlot(c.log, c.routingKernspaceSnapshot); err != nil {
 			return fmt.Errorf("routing kernspace snapshot: %w", err)
 		}
-		c.core.lpmTrieIndices = lpmIndices
 		if err := c.core.StageRoutingEpoch(); err != nil {
 			return fmt.Errorf("stage routing epoch: %w", err)
 		}
@@ -309,15 +303,9 @@ func (c *ControlPlane) RestoreDatapathForReloadRollback() error {
 		return fmt.Errorf("restore interface bindings: %w", err)
 	}
 	if c.routingKernspaceSnapshot != nil {
-		lpmIndices, err := c.routingKernspaceSnapshot.BuildKernspaceForSlot(
-			c.log,
-			c.core.bpf.Load(),
-			c.core.RoutingEpochSlot(),
-		)
-		if err != nil {
+		if _, err := c.core.buildRoutingKernspaceForSlot(c.log, c.routingKernspaceSnapshot); err != nil {
 			return fmt.Errorf("restore routing kernspace: %w", err)
 		}
-		c.ReplaceLpmIndices(lpmIndices)
 		if err := c.core.StageRoutingEpoch(); err != nil {
 			return fmt.Errorf("restore routing epoch: %w", err)
 		}

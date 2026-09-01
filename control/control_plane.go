@@ -36,14 +36,17 @@ import (
 	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/config"
 	internal "github.com/daeuniverse/dae/pkg/ebpf_internal"
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
+	"github.com/daeuniverse/outbound/protocol/direct"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
 type ControlPlane struct {
-	log *logrus.Logger
+	log          *logrus.Logger
+	directDialer netproxy.Dialer
 
 	runtimeStats *runtimeStats
 
@@ -126,6 +129,9 @@ type ControlPlaneBuildOptions struct {
 	DelayDNSListenerStart bool
 	DNSRoutingUnchanged   bool
 	IsReload              bool
+	DirectDialer          netproxy.Dialer
+	FullconeDirectDialer  netproxy.Dialer
+	SystemDNSResolver     *netutils.SystemDNSResolver
 }
 
 var (
@@ -297,7 +303,7 @@ func NewControlPlaneWithContextOptions(
 
 	/// Allow the current process to lock memory for eBPF resources.
 	if err = rlimit.RemoveMemlock(); err != nil {
-		return nil, fmt.Errorf("rlimit.RemoveMemlock:%v", err)
+		return nil, fmt.Errorf("rlimit.RemoveMemlock: %w", err)
 	}
 
 	InitDaeNetns(log)
@@ -452,9 +458,26 @@ func NewControlPlaneWithContextOptions(
 	if global.AllowInsecure {
 		log.Warnln("AllowInsecure is enabled, but it is not recommended. Please make sure you have to turn it on.")
 	}
+	directDialer := buildOpts.DirectDialer
+	if directDialer == nil {
+		directDialer = direct.SymmetricDirect
+	}
+	fullconeDirectDialer := buildOpts.FullconeDirectDialer
+	if fullconeDirectDialer == nil {
+		fullconeDirectDialer = direct.FullconeDirect
+	}
+	systemDNSResolver := buildOpts.SystemDNSResolver
+	if systemDNSResolver == nil {
+		systemDNSResolver = netutils.NewSystemDNSResolver(netip.MustParseAddrPort(global.FallbackResolver))
+	}
+
 	locationFinder := assets.NewLocationFinder(externGeoDataDirs)
 	option := dialer.NewGlobalOption(global, log)
-	option.DaeDNS, err = daedns.NewWithOption(log, global, dnsConfig, &daedns.NewOption{LocationFinder: locationFinder})
+	option.SetRuntimeDependencies(directDialer, fullconeDirectDialer, systemDNSResolver)
+	option.DaeDNS, err = daedns.NewWithOption(log, global, dnsConfig, &daedns.NewOption{
+		LocationFinder: locationFinder,
+		DirectDialer:   directDialer,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -607,14 +630,12 @@ func NewControlPlaneWithContextOptions(
 	kernspaceSnapshot := builder.KernspaceSnapshot()
 	if !buildOpts.DelayDatapathCommit {
 		log.Infoln("Loading routing rules into kernel space (BPF)...")
-		var lpmIndices []uint32
-		if lpmIndices, err = kernspaceSnapshot.BuildKernspaceForSlot(log, core.bpf.Load(), core.RoutingEpochSlot()); err != nil {
+		if _, err = core.buildRoutingKernspaceForSlot(log, kernspaceSnapshot); err != nil {
 			return nil, fmt.Errorf("routing kernspace snapshot: %w", err)
 		}
 		if err = core.StageRoutingEpoch(); err != nil {
 			return nil, fmt.Errorf("stage routing epoch: %w", err)
 		}
-		core.lpmTrieIndices = lpmIndices
 	} else {
 		log.Infoln("Prepared routing matcher; kernel-space routing commit deferred until listener cutover")
 	}
@@ -673,6 +694,7 @@ func NewControlPlaneWithContextOptions(
 	cctx, cancel := context.WithCancel(context.Background())
 	plane = &ControlPlane{
 		log:           log,
+		directDialer:  directDialer,
 		runtimeStats:  newRuntimeStats(),
 		core:          core,
 		deferFuncs:    planeDeferFuncs,
@@ -708,7 +730,8 @@ func NewControlPlaneWithContextOptions(
 		mptcp:                         global.Mptcp,
 		udpRouteScopeSensitive:        builder.UsesPacketMetadataRouting(),
 		controlPlaneUDPRuntime: controlPlaneUDPRuntime{
-			failedQuicDcidCache: newFailedQuicDcidCache(failedQuicDcidCacheMaxEntries),
+			failedQuicDcidCache:  newFailedQuicDcidCache(failedQuicDcidCacheMaxEntries),
+			udpDirectDispatchSem: make(chan struct{}, udpDirectDispatchConcurrency),
 		},
 	}
 	SetFailedQuicDcidCache(plane.failedQuicDcidCache)
@@ -2296,6 +2319,10 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			task.realDst = realDst
 			task.convergeSrc = convergeSrc
 			task.flowDecision = flowDecision
+			// Reset on every checkout: a stale slot pointer from a previous
+			// use would make Run or Discard release a semaphore this packet
+			// never acquired. The direct path reassigns it after acquiring.
+			task.dispatchSem = nil
 
 			// Session FIFO now takes precedence for generic UDP forwarding.
 			// Ordered ingress keeps same-flow packets in the order they were read
@@ -2304,15 +2331,27 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			// exceptions where queue handoff is less valuable than minimal overhead
 			// (DNS, SIP/RTP, STUN).
 			if flowDecision.DispatchStrategy() == StrategyDirectGoroutine {
-				// DNS, VoIP, and other low-latency exception traffic bypasses the
-				// ordered per-flow queue and runs immediately.
-				go task.Run()
+				// DNS, VoIP, and other low-latency exception traffic bypasses
+				// the ordered per-flow queue and runs immediately, but under
+				// a generous concurrency cap: an unbounded `go` here would
+				// turn a UDP flood on any exception port into unbounded
+				// goroutine and buffer growth. Saturation drops the packet
+				// like ordinary UDP loss (clients retransmit) and recycles
+				// the task inline.
+				select {
+				case c.udpDirectDispatchSem <- struct{}{}:
+					task.dispatchSem = c.udpDirectDispatchSem
+					go task.Run()
+				default:
+					task.Discard()
+				}
 			} else if !DefaultUdpTaskPool.EmitTask(flowDecision.Key, task) {
 				// Rejected: the pool does not own the buffer or the admission,
 				// so release both inline and return the task to the pool (it
 				// was never queued, so Run() will not run).
 				c.udpIngressAdmission.release()
 				pktBuf.Put()
+				*task = udpIngressTask{}
 				udpIngressTaskPool.Put(task)
 			}
 			// if d := time.Since(t); d > 100*time.Millisecond {

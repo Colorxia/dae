@@ -124,6 +124,16 @@ type dnsControllerStore struct {
 	// When ip_version_prefer is set, non-preferred responses wait briefly
 	// for preferred responses to arrive (RFC 8305 Happy Eyeballs).
 	prefWaitRegistry *preferenceWaitRegistry
+
+	// handleGate accounts for request handlers that entered through the
+	// active-plane dispatch. The publication RWMutex used to be held across
+	// whole DNS queries, which let one slow upstream head-of-line block a
+	// reload publish (and every new reader queued behind it). Dispatch now
+	// releases the lock immediately after admission; Close flips the gate
+	// shut and drains the counter before forwarders are torn down, which
+	// preserves the old lifetime guarantee for in-flight queries.
+	handleClosed   atomic.Bool
+	handleInflight atomic.Int64
 }
 
 // DnsController is a lightweight generation-local facade over a shared
@@ -136,7 +146,17 @@ type DnsController struct {
 	concurrencyLimiter chan struct{}
 
 	dnsForwarderIdleTTL time.Duration
-	log                 *logrus.Logger
+	// log is assigned only at construction (NewDnsController) and never
+	// rewritten afterwards, so lock-free readers are race-free. Reloads keep
+	// it valid without reassignment: the daemon builds exactly one
+	// logrus.Logger (cmd/run.go) and mutates it in place on reload via
+	// logger.SetLogger (SetLevel/SetFormatter are mutex-safe), so the
+	// construction-time pointer stays correct across generations. Never store
+	// nil: several call sites branch on log != nil. If per-generation loggers
+	// are ever introduced (e.g. per-generation log files), convert this field
+	// to atomic.Pointer[logrus.Logger] and re-add the updateRuntime
+	// assignment.
+	log *logrus.Logger
 }
 
 func newDnsControllerStore() *dnsControllerStore {
@@ -233,7 +253,7 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 
 	controller := &DnsController{
 		dnsControllerStore:  newDnsControllerStore(),
-		concurrencyLimiter:  make(chan struct{}, limit), // 0 means no limit (unbuffered channel, always non-blocking)
+		concurrencyLimiter:  make(chan struct{}, limit),
 		log:                 option.Log,
 		dnsForwarderIdleTTL: dnsForwarderIdleTTL, // Use package-level default
 	}
@@ -320,8 +340,11 @@ func (c *DnsController) Close() error {
 		}
 	}
 
-	errs := c.closeAllDnsForwarders()
+	// Reject new active-plane dispatches and let in-flight handlers finish
+	// before forwarders are torn down, bounded by the same graceful budget.
+	c.closeHandleGate()
 
+	errs := c.closeAllDnsForwarders()
 	// Clear dnsCache to prevent memory leak on reload.
 	// Each DnsCache entry contains DomainBitmap and Answer which can accumulate
 	// significant memory over time if not released.
@@ -349,6 +372,52 @@ func (c *DnsController) Close() error {
 	c.bpfRetryMu.Unlock()
 
 	return errors.Join(errs...)
+}
+
+// acquireHandleGate admits an active-plane dispatch while the controller is
+// open. The double-check makes admission atomic with Close's flip: a caller
+// racing the flip either observes closed and fails fast, or is counted
+// before closeHandleGate's drain observes it.
+func (c *DnsController) acquireHandleGate() bool {
+	if c.handleClosed.Load() {
+		return false
+	}
+	c.handleInflight.Add(1)
+	if c.handleClosed.Load() {
+		c.handleInflight.Add(-1)
+		return false
+	}
+	return true
+}
+
+func (c *DnsController) releaseHandleGate() {
+	c.handleInflight.Add(-1)
+}
+
+// closeHandleGate rejects new dispatches and waits for the in-flight ones so
+// Close does not tear forwarders down under a running handler.
+func (c *DnsController) closeHandleGate() {
+	c.handleClosed.Store(true)
+	if c.handleInflight.Load() == 0 {
+		return
+	}
+	if c.log != nil {
+		c.log.Debug("DnsController.Close: waiting for in-flight DNS request handlers")
+	}
+	timer := time.NewTimer(gracefulShutdownWaitTimeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(2 * time.Millisecond)
+	defer ticker.Stop()
+	for c.handleInflight.Load() > 0 {
+		select {
+		case <-timer.C:
+			if c.log != nil {
+				c.log.Warn("DnsController.Close: timeout waiting for in-flight DNS request handlers")
+			}
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 var (
