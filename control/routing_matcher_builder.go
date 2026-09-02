@@ -6,7 +6,6 @@
 package control
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -206,6 +205,11 @@ func (b *RoutingMatcherBuilder) outboundToId(outbound string) (uint8, error) {
 		outboundId = uint8(consts.OutboundLogicalAnd)
 	case consts.OutboundMustRules.String():
 		outboundId = uint8(consts.OutboundMustRules)
+	case consts.OutboundControlPlaneRouting.String():
+		// Implicit sniff-punt lines steer unknown-domain traffic of a device
+		// whitelist to userspace for sniffed-domain re-routing. They carry no
+		// group and must never register as a health-checked reference.
+		outboundId = uint8(consts.OutboundControlPlaneRouting)
 	default:
 		var ok bool
 		outboundId, ok = b.outboundName2Id[outbound]
@@ -302,7 +306,7 @@ func (b *RoutingMatcherBuilder) addSourceMac(f *config_parser.Function, macAddrs
 		Mark:     outbound.Mark,
 		Must:     bpfBool(outbound.Must),
 	}
-	binary.LittleEndian.PutUint32(set.Value[:], uint32(lpmTrieIndex))
+	nativeBpfABI.putUint32(set.Value[:], uint32(lpmTrieIndex))
 	compiled := newCompiledRoutingBase(consts.MatchType_Mac, f.Not, outboundId, outbound.Mark, outbound.Must)
 	compiled.lpmIndex = uint32(lpmTrieIndex)
 	b.appendRule(set, compiled)
@@ -341,7 +345,7 @@ func (b *RoutingMatcherBuilder) addIp(f *config_parser.Function, values []netip.
 		Mark:     outbound.Mark,
 		Must:     bpfBool(outbound.Must),
 	}
-	binary.LittleEndian.PutUint32(set.Value[:], lpmTrieIndex)
+	nativeBpfABI.putUint32(set.Value[:], lpmTrieIndex)
 	compiled := newCompiledRoutingBase(consts.MatchType_IpSet, f.Not, outboundId, outbound.Mark, outbound.Must)
 	compiled.lpmIndex = lpmTrieIndex
 	b.appendRule(set, compiled)
@@ -409,7 +413,7 @@ func (b *RoutingMatcherBuilder) addSourceIp(f *config_parser.Function, values []
 		Mark:     outbound.Mark,
 		Must:     bpfBool(outbound.Must),
 	}
-	binary.LittleEndian.PutUint32(set.Value[:], lpmTrieIndex)
+	nativeBpfABI.putUint32(set.Value[:], lpmTrieIndex)
 	compiled := newCompiledRoutingBase(consts.MatchType_SourceIpSet, f.Not, outboundId, outbound.Mark, outbound.Must)
 	compiled.lpmIndex = lpmTrieIndex
 	b.appendRule(set, compiled)
@@ -617,12 +621,12 @@ func rewriteKernRulesWithRingLpmIndex(rules []bpfMatchSet, allocStartIdx uint32,
 		matchType := consts.MatchType(rule.Type)
 		switch matchType {
 		case consts.MatchType_IpSet, consts.MatchType_SourceIpSet, consts.MatchType_Mac:
-			oldLpmIndex := binary.LittleEndian.Uint32(rule.Value[:4])
+			oldLpmIndex := nativeBpfABI.uint32(rule.Value[:4])
 			if oldLpmIndex >= lpmCount {
 				return nil, fmt.Errorf("bad lpm index in rule[%d]: %d >= %d", i, oldLpmIndex, lpmCount)
 			}
 			newLpmIndex := (allocStartIdx + oldLpmIndex) % maxEntries
-			binary.LittleEndian.PutUint32(kernRules[i].Value[:4], newLpmIndex)
+			nativeBpfABI.putUint32(kernRules[i].Value[:4], newLpmIndex)
 		}
 	}
 	return kernRules, nil
