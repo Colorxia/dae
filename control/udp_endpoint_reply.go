@@ -157,7 +157,7 @@ func (ue *UdpEndpoint) prewarmResponseConn(target string) {
 	if GetDaeNetns() == nil || DefaultAnyfromPool == nil {
 		return
 	}
-	af, _, err := DefaultAnyfromPool.getOrCreateWithMark(bindAddr, replySoMark, AnyfromTimeout)
+	af, _, err := DefaultAnyfromPool.getOrCreateWithMark(bindAddr, replySoMark)
 	if err != nil {
 		return
 	}
@@ -288,13 +288,29 @@ func takeUdpEndpointReply(data pool.PB, from netip.AddrPort) *udpEndpointReply {
 	return reply
 }
 
-func recycleUdpEndpointReply(reply *udpEndpointReply, releaseData bool) {
+// recycleUdpEndpointReply returns a reply object to its pool.
+//
+// releaseDataWhenNoOwner decides what happens to the payload when the reply
+// carries no transport-owned release callback:
+//   - true: this call owns the buffer and returns it to the pool.
+//   - false: somebody else still owns it, so nothing is released here.
+//
+// The false case is NOT a leak and must not be "fixed" to true: the senderStop
+// branch of startReadLoop hands the reply back while the read loop's own defer
+// (putUdpEndpointReplyData(buf)) is still the single owner of that same
+// underlying array - buf is not replaced before the early return. Releasing
+// here as well would Put the same array twice, and pool.Put buckets by cap
+// without being idempotent, so the array would then be handed out to two
+// consumers at once (silent aliasing/corruption). The exactly-once accounting
+// is locked by TestSenderStopRecycleDoesNotDoubleRelease and by
+// udp_endpoint_receiver_lifecycle_test.go.
+func recycleUdpEndpointReply(reply *udpEndpointReply, releaseDataWhenNoOwner bool) {
 	if reply == nil {
 		return
 	}
 	if reply.release != nil {
 		reply.release()
-	} else if releaseData {
+	} else if releaseDataWhenNoOwner {
 		putUdpEndpointReplyData(reply.data)
 	}
 	*reply = udpEndpointReply{}
@@ -309,8 +325,12 @@ func releaseUdpEndpointReplies(replies []*udpEndpointReply) {
 
 // replySender is the dedicated goroutine that drains the reply channel and
 // calls the handler (which invokes sendPkt). Running this off the read loop
-// avoids blocking the upstream protocol layer's ReceiveCh.
-func (ue *UdpEndpoint) replySender(replyCh <-chan *udpEndpointReply, stop chan<- struct{}, done chan<- struct{}) {
+// avoids blocking the upstream protocol layer's ReceiveCh. The creator binds
+// retire to this sender's lifecycle: a push sender must not synchronously call
+// Close, which waits for its done channel even after the shared queue closes.
+// A ReadFrom sender must close the conn to wake its read loop, including after
+// failed push registration has left behind a closed shared queue.
+func (ue *UdpEndpoint) replySender(replyCh <-chan *udpEndpointReply, stop chan<- struct{}, done chan<- struct{}, retire func()) {
 	defer close(done)
 	batch := make([]*udpEndpointReply, 0, 8)
 	for reply := range replyCh {
@@ -338,7 +358,7 @@ func (ue *UdpEndpoint) replySender(replyCh <-chan *udpEndpointReply, stop chan<-
 			// upstream endpoint's liveness.
 			if err := ue.handler(ue, queued.data, queued.from); err != nil {
 				releaseUdpEndpointReplies(batch[i:])
-				ue.retireFromReplySender()
+				retire()
 				close(stop)
 				ue.logEndpointExit(err, "reply sender")
 				// Drain remaining queued replies to release pool buffers.

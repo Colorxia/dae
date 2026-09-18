@@ -70,6 +70,16 @@ type Router struct {
 	httpSendFunc          httpDNSQueryFunc
 	httpTransportFactory  httpTransportFactoryFunc
 	closed                bool
+
+	// Upstream UDP reply validation (observe-only). udpStaleResponses counts
+	// datagrams whose transaction ID does not match the request (previously
+	// dropped with no signal at all); udpQuestionEchoMismatches counts replies
+	// whose ID matched but whose question section does not echo the request
+	// (RFC 5452). Neither changes the accept condition yet: they make the
+	// condition observable before it is tightened.
+	udpStaleResponses             atomic.Uint64
+	udpQuestionEchoMismatches     atomic.Uint64
+	lastUDPQuestionEchoMismatchAt atomic.Int64
 }
 
 type lookupCall struct {
@@ -362,29 +372,6 @@ func (r *Router) WrapNodeDialer(base netproxy.Dialer, meta NodeMeta) (netproxy.D
 		return base, nil
 	}
 	return newResolvingDialer(base, r, upstream, upstream, meta.AddressHost), nil
-}
-
-func (r *Router) MatchSubscriptionUpstream(rawSubscription string) (string, bool) {
-	if r == nil {
-		return "", false
-	}
-	tag, link := common.GetTagFromLinkLikePlaintext(rawSubscription)
-	return r.subMatcher.Match(subscriptionMeta{
-		Tag:  tag,
-		Link: link,
-	})
-}
-
-func (r *Router) MatchNodeUpstream(meta NodeMeta) (string, bool) {
-	if r == nil {
-		return "", false
-	}
-	if meta.SubscriptionTag != "" {
-		if upstream, ok := r.subNodeMatcher.Match(meta); ok {
-			return upstream, true
-		}
-	}
-	return r.nodeMatcher.Match(meta)
 }
 
 func (r *Router) compileSubscriptionMatcher(rules []*config_parser.RoutingRule) (*compiledMatcher[subscriptionMeta], error) {

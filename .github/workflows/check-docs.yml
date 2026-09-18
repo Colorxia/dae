@@ -4,7 +4,10 @@ on:
   workflow_dispatch:
   workflow_call:
   pull_request:
-    branches: [main]
+    # `kdae` is the development branch of this fork; with only `main` listed
+    # this gate never ran on the branch that receives the documentation
+    # changes (P3-22).
+    branches: [main, kdae]
     types: [ opened, synchronize, reopened ]
     paths:
       - 'README.md'
@@ -12,7 +15,16 @@ on:
       - 'package.json'
       - '.autocorrectrc'
       - '.markdownlint-cli2.jsonc'
+      # The markdownlint ratchet and the ledger it compares against: changing
+      # either has to re-run the gate that judges it.
+      - '.markdownlint-baseline.txt'
+      - 'scripts/check-markdownlint-baseline.sh'
+      - 'scripts/test-markdownlint-ratchet.sh'
+      - 'scripts/testdata/markdownlint-ci-sample.txt'
       - '.github/workflows/check-docs.yml'
+
+permissions:
+  contents: read
 
 jobs:
   check-doc:
@@ -20,9 +32,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Self-test the markdownlint ratchet
+        run: |
+          # Pure bash, no npm: proves the ratchet still passes on a baseline
+          # match, still fails on a violation outside the baseline, and still
+          # refuses to read a broken lint run as a clean tree. Runs first so a
+          # broken parser fails fast rather than being trusted below.
+          bash scripts/test-markdownlint-ratchet.sh
       - name: Use Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@3235b876344d2a9aa001b8d1453c930bba69e610 # v3
         with:
           node-version: '16.x'
           cache: 'npm'
@@ -31,9 +50,18 @@ jobs:
           npm ci
       - name: Lint Markdown files (markdownlint)
         run: |
-          npm run markdown-lint
+          # markdownlint exits non-zero on the first violation, and this branch
+          # carries pre-existing documentation debt that this change does not
+          # touch (see .markdownlint-baseline.txt). So the step is not judged on
+          # markdownlint's own exit code: the output is fed to the ratchet,
+          # which fails on any violation that is not already in the ledger.
+          # Linting and judging stay in one step on purpose - a step that goes
+          # green while markdownlint printed violations would be a silent pass.
+          npm run markdown-lint > "${RUNNER_TEMP}/markdownlint.log" 2>&1 || true
+          cat "${RUNNER_TEMP}/markdownlint.log"
+          bash scripts/check-markdownlint-baseline.sh "${RUNNER_TEMP}/markdownlint.log"
       - name: Lint Markdown files (autocorrect)
-        uses: huacnlee/autocorrect-action@main
+        uses: huacnlee/autocorrect-action@bf91ab3904c2908dd8e71312a8a83ed1eb632997 # main
         with:
           args: --lint ./docs/
       - name: Check broken link (including broken anchor)

@@ -6,6 +6,7 @@
 package control
 
 import (
+	"fmt"
 	"net/netip"
 	"sync/atomic"
 	"time"
@@ -188,35 +189,6 @@ func (c *DnsCache) MarkBpfUpdated(now time.Time) {
 	c.lastBpfDataHash.Store(c.ComputeBpfDataHash())
 }
 
-func (c *DnsCache) FillInto(req *dnsmessage.Msg) {
-	req.Answer = nil
-	if c.Answer != nil {
-		req.Answer = make([]dnsmessage.RR, len(c.Answer))
-		for i, rr := range c.Answer {
-			req.Answer[i] = dnsmessage.Copy(rr)
-		}
-	}
-	req.Ns = nil
-	if c.NS != nil {
-		req.Ns = make([]dnsmessage.RR, len(c.NS))
-		for i, rr := range c.NS {
-			req.Ns[i] = dnsmessage.Copy(rr)
-		}
-	}
-	req.Extra = nil
-	if c.Extra != nil {
-		req.Extra = make([]dnsmessage.RR, len(c.Extra))
-		for i, rr := range c.Extra {
-			req.Extra[i] = dnsmessage.Copy(rr)
-		}
-	}
-
-	req.Rcode = dnsmessage.RcodeSuccess
-	req.Response = true
-	req.RecursionAvailable = true
-	req.Truncated = false
-}
-
 // CloneForReload creates a new generation-local cache wrapper for reload.
 //
 // WARNING: Answer, NS, and Extra slices share memory with the original cache.
@@ -279,12 +251,43 @@ func ttlScratchSlice(n int, stack *[8]uint32) []uint32 {
 	return make([]uint32, n)
 }
 
-func setSectionTTL(rrs []dnsmessage.RR, ttl uint32, scratch []uint32) {
-	for i, rr := range rrs {
-		hdr := rr.Header()
-		scratch[i] = hdr.Ttl
+func setRecordTTL(rr dnsmessage.RR, ttl uint32) {
+	hdr := rr.Header()
+	// OPT encodes EDNS version and flags in this field, not a lifetime.
+	if hdr.Rrtype != dnsmessage.TypeOPT {
 		hdr.Ttl = ttl
 	}
+}
+
+func setSectionTTL(rrs []dnsmessage.RR, ttl uint32, scratch []uint32) {
+	for i, rr := range rrs {
+		scratch[i] = rr.Header().Ttl
+		setRecordTTL(rr, ttl)
+	}
+}
+
+// copySectionWithTTL deep-copies a record section and stamps the remaining
+// lifetime onto every record. This is the single place where the "materialize a
+// stored section onto the wire at a given remaining TTL" policy lives, so the
+// pre-packed path and the in-place fallback cannot drift apart.
+//
+// Answers carry a real TTL: the first answer carries the TTL the upstream
+// returned, a cache hit the remaining lifetime of the entry. dae tracks
+// freshness of its own address answers through the entry deadline and the stale
+// window rather than by telling resolvers not to cache, so nothing here may
+// rewrite a lifetime to zero. The EDNS OPT pseudo-record is never treated as a
+// TTL (see setRecordTTL).
+func copySectionWithTTL(rrs []dnsmessage.RR, ttl uint32) []dnsmessage.RR {
+	if rrs == nil {
+		return nil
+	}
+	copied := make([]dnsmessage.RR, len(rrs))
+	for i, rr := range rrs {
+		record := dnsmessage.Copy(rr)
+		setRecordTTL(record, ttl)
+		copied[i] = record
+	}
+	return copied
 }
 
 func restoreSectionTTL(rrs []dnsmessage.RR, scratch []uint32) {
@@ -371,30 +374,9 @@ func (c *DnsCache) prepackResponseWithTTL(qname string, qtype uint16, ttl uint32
 		Compress: true,
 	}
 
-	if c.Answer != nil {
-		msg.Answer = make([]dnsmessage.RR, len(c.Answer))
-		for i, rr := range c.Answer {
-			copiedRR := dnsmessage.Copy(rr)
-			copiedRR.Header().Ttl = ttl
-			msg.Answer[i] = copiedRR
-		}
-	}
-	if c.NS != nil {
-		msg.Ns = make([]dnsmessage.RR, len(c.NS))
-		for i, rr := range c.NS {
-			copiedRR := dnsmessage.Copy(rr)
-			copiedRR.Header().Ttl = ttl
-			msg.Ns[i] = copiedRR
-		}
-	}
-	if c.Extra != nil {
-		msg.Extra = make([]dnsmessage.RR, len(c.Extra))
-		for i, rr := range c.Extra {
-			copiedRR := dnsmessage.Copy(rr)
-			copiedRR.Header().Ttl = ttl
-			msg.Extra[i] = copiedRR
-		}
-	}
+	msg.Answer = copySectionWithTTL(c.Answer, ttl)
+	msg.Ns = copySectionWithTTL(c.NS, ttl)
+	msg.Extra = copySectionWithTTL(c.Extra, ttl)
 
 	packed, err := msg.Pack()
 	if err != nil {
@@ -509,10 +491,12 @@ func (c *DnsCache) MarkRefreshed() {
 
 // fillIntoWithTTLInPlace mutates req directly and should only be used when the
 // caller has unique ownership of req and will not reuse it after the call,
-// including on pack failure.
-func (c *DnsCache) fillIntoWithTTLInPlace(req *dnsmessage.Msg, now time.Time) []byte {
+// including on pack failure. A pack failure is reported to the caller instead
+// of degrading into a silent cache miss: the caller turns it into an operator
+// visible warning and then resolves the name upstream.
+func (c *DnsCache) fillIntoWithTTLInPlace(req *dnsmessage.Msg, now time.Time) ([]byte, error) {
 	if req == nil {
-		return nil
+		return nil, nil
 	}
 	req.Answer = nil
 	req.Rcode = dnsmessage.RcodeSuccess
@@ -522,28 +506,26 @@ func (c *DnsCache) fillIntoWithTTLInPlace(req *dnsmessage.Msg, now time.Time) []
 
 	if c.Answer == nil {
 		req.Compress = true
-		b, _ := req.Pack()
-		return b
+		resp, err := req.Pack()
+		if err != nil {
+			return nil, fmt.Errorf("pack cached DNS response without answer: %w", err)
+		}
+		return resp, nil
 	}
 
 	// Calculate remaining TTL based on the provided time
 	remainingTTL := ttlFromDeadline(c.Deadline, now)
 
-	// Copy answers with updated TTL
-	req.Answer = make([]dnsmessage.RR, len(c.Answer))
-	for i, rr := range c.Answer {
-		copiedRR := dnsmessage.Copy(rr)
-		// Update TTL to remaining time
-		copiedRR.Header().Ttl = remainingTTL
-		req.Answer[i] = copiedRR
-	}
+	// Copy answers with updated TTL. Shared with the pre-packed path so both
+	// materializations apply the same record-level TTL policy.
+	req.Answer = copySectionWithTTL(c.Answer, remainingTTL)
 
 	req.Compress = true
-	b, err := req.Pack()
+	resp, err := req.Pack()
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("pack cached DNS response: %w", err)
 	}
-	return b
+	return resp, nil
 }
 
 // FillIntoWithTTL fills the DNS response with correct remaining TTL.
@@ -553,24 +535,15 @@ func (c *DnsCache) fillIntoWithTTLInPlace(req *dnsmessage.Msg, now time.Time) []
 // This method preserves the caller's request on failure by operating on a copy.
 // Hot paths that already own the message exclusively should use
 // fillIntoWithTTLInPlace to avoid the extra allocation.
-func (c *DnsCache) FillIntoWithTTL(req *dnsmessage.Msg, now time.Time) []byte {
+func (c *DnsCache) FillIntoWithTTL(req *dnsmessage.Msg, now time.Time) ([]byte, error) {
 	if req == nil {
-		return nil
+		return nil, nil
 	}
 	resp := req.Copy()
 	if resp == nil {
-		return nil
+		return nil, nil
 	}
 	return c.fillIntoWithTTLInPlace(resp, now)
-}
-
-func (c *DnsCache) IncludeIp(ip netip.Addr) bool {
-	for _, ans := range c.Answer {
-		if a, ok := dnsAnswerIP(ans); ok && a == ip {
-			return true
-		}
-	}
-	return false
 }
 
 func dnsAnswerIP(rr dnsmessage.RR) (netip.Addr, bool) {

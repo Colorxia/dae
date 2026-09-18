@@ -103,6 +103,7 @@ func DnsCorpusFixtures() []DnsCorpusFixture {
 		udpCacheHitAAAAFixture(),
 		negativeResponseFixture(),
 		udpCacheStaleOptimisticFixture(),
+		udpCacheStaleCnameNodataRefreshFixture(),
 		tcpUdpFallbackFixture(),
 		tcpUdpBlackholeFallbackFixture(),
 		rejectBeforeCacheFixture(),
@@ -131,7 +132,6 @@ func ReplayDns(t *testing.T, fixture DnsCorpusFixture) {
 	setScopedBestDialerChooser(ctrl, chooser)
 
 	for _, tc := range fixture.Cases {
-		tc := tc
 		t.Run(tc.Name, func(t *testing.T) {
 			if tc.PreState != nil {
 				tc.PreState(t, ctrl)
@@ -279,7 +279,9 @@ func installCorpusCache(t testing.TB, ctrl *DnsController, cacheKey, qname strin
 	stable := *packed
 	stable.createdAtUnixNano = deadline.UnixNano()
 	cache.packedResponse.Store(&stable)
-	ctrl.dnsCache.Store(cacheKey, cache)
+	// Publish through the controller's store so the entry also registers in
+	// the base-key index, exactly as a production insert would.
+	ctrl.storeDnsCache(cacheKey, cache)
 }
 
 func cloneCorpusRRs(rrs []dnsmessage.RR) []dnsmessage.RR {

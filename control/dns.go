@@ -15,6 +15,7 @@ import (
 	"math/bits"
 	"net"
 	"net/http"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,8 +61,16 @@ var responseSlotPool = sync.Pool{
 	},
 }
 
-// sendStreamDNSFunc is an indirection for tests that replace stream DNS I/O.
-var sendStreamDNSFunc = dnstransport.SendStreamDNS
+// doqExchangeTimeout bounds a single DNS-over-QUIC exchange when the caller
+// did not already provide a tighter deadline. Quic-go streams only observe
+// cancellation through deadlines, and a peer that keeps the connection alive
+// while withholding a response must not pin this goroutine, the singleflight
+// slot and the open stream indefinitely.
+const doqExchangeTimeout = 8 * time.Second
+
+// doqRequestCancelledCode is DOQ_REQUEST_CANCELLED (RFC 9250 §4.3.1), sent
+// via STOP_SENDING/RESET_STREAM when a query is abandoned.
+const doqRequestCancelledCode quic.StreamErrorCode = 0x3
 
 func newResponseSlot() *responseSlot {
 	s := responseSlotPool.Get().(*responseSlot)
@@ -414,40 +423,109 @@ type DoQ struct {
 }
 
 func (d *DoQ) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, error) {
-	connection, err := d.getOrCreateConnection(ctx)
+	// Bound the whole exchange (dial/open included) by the caller context and
+	// the exchange cap.
+	exchangeCtx, cancelExchange := context.WithTimeout(ctx, doqExchangeTimeout)
+	defer cancelExchange()
+
+	connection, err := d.getOrCreateConnection(exchangeCtx)
 	if err != nil {
 		return nil, err
 	}
 
-	stream, err := connection.OpenStreamSync(ctx)
+	stream, err := connection.OpenStreamSync(exchangeCtx)
 	if err != nil {
-		if ctx.Err() != nil {
+		if exchangeCtx.Err() != nil {
 			return nil, err
 		}
 		// If failed to open stream, we should try to create a new connection.
-		connection, err = d.replaceConnection(ctx, connection)
+		connection, err = d.replaceConnection(exchangeCtx, connection)
 		if err != nil {
 			return nil, err
 		}
-		stream, err = connection.OpenStreamSync(ctx)
+		stream, err = connection.OpenStreamSync(exchangeCtx)
 		if err != nil {
 			return nil, err
 		}
 	}
+
+	// Apply the exchange deadline to the stream I/O and unblock any parked
+	// Read/Write synchronously when the exchange context is done. Cancellation
+	// never closes the shared QUIC connection: only this stream is abandoned.
+	finSent := false
+	writeCanceled := false
 	defer func() {
-		// Best effort cleanup; stream may already be closed by QUIC implementation.
-		_ = stream.Close()
+		if !finSent && !writeCanceled {
+			// Best effort cleanup; the stream may already be closed by the
+			// QUIC implementation.
+			_ = stream.Close()
+		}
 	}()
+	if deadline, ok := exchangeCtx.Deadline(); ok {
+		_ = stream.SetDeadline(deadline)
+	}
+	stopWatchdog := context.AfterFunc(exchangeCtx, func() {
+		// A past deadline unblocks any Read/Write parked inside quic-go.
+		_ = stream.SetDeadline(time.Unix(1, 0))
+	})
+	defer stopWatchdog()
 
 	// According https://datatracker.ietf.org/doc/html/rfc9250#section-4.2.1
 	// msg id should set to 0 when transport over QUIC.
 	// thanks https://github.com/natesales/q/blob/1cb2639caf69bd0a9b46494a3c689130df8fb24a/transport/quic.go#L97
 	binary.BigEndian.PutUint16(data[0:2], 0)
 
-	msg, err := sendStreamDNSFunc(stream, data)
-	if err != nil {
+	// Write the complete query, then close the write side (FIN) before
+	// reading: DoQ servers answer only after the query FIN (RFC 9250 §4.2).
+	if err := dnstransport.WriteFramedDNSQuery(stream, data); err != nil {
+		if exchangeCtx.Err() != nil {
+			err = exchangeCtx.Err()
+		}
+		// The query never completed; abandon the whole stream: reset the
+		// write side so the peer can discard the partial query and its
+		// resources, and cancel the read side (STOP_SENDING, RFC 9250
+		// §4.3.1) so the receive half is released instead of pinning the
+		// stream on the reused connection until it is replaced.
+		writeCanceled = true
+		stream.CancelWrite(doqRequestCancelledCode)
+		stream.CancelRead(doqRequestCancelledCode)
 		return nil, err
 	}
+	if err := stream.Close(); err != nil {
+		// FIN could not be delivered. quic-go reports an error here when the
+		// send half was cancelled (e.g. a peer STOP_SENDING racing the
+		// query), not only when the connection is gone, so the receive half
+		// may still be open on a healthy connection: cancel it too instead of
+		// leaving the stream half-open.
+		if exchangeCtx.Err() != nil {
+			err = exchangeCtx.Err()
+		}
+		stream.CancelRead(doqRequestCancelledCode)
+		return nil, err
+	}
+	finSent = true
+
+	msg, err := dnstransport.ReadFramedDNSResponse(stream)
+	if err != nil {
+		if exchangeCtx.Err() != nil {
+			err = exchangeCtx.Err()
+		}
+		// Abandoning the query: ask the peer to stop transmitting (RFC 9250
+		// §4.3.1). No-op once the peer already sent the full response.
+		stream.CancelRead(doqRequestCancelledCode)
+		return nil, err
+	}
+	// The framed response has been fully consumed, but quic-go completes a
+	// stream only when both halves finish, and the receive half finishes only
+	// when a read observes EOF or the stream is cancelled locally. DoQ
+	// servers close their send side after answering (RFC 9250 §4.2), yet the
+	// FIN can arrive after the payload; without cancellation the read half
+	// stays open and holds the stream slot on the reused connection until the
+	// connection is replaced. CancelRead releases the receive half and sends
+	// STOP_SENDING (RFC 9250 §4.3.1); the slot itself is reclaimed once the
+	// peer's FIN or RESET arrives and the send half has completed, which a
+	// well-behaved DoQ server provides immediately after answering.
+	stream.CancelRead(doqRequestCancelledCode)
 	return msg, nil
 }
 
@@ -483,11 +561,17 @@ func (d *DoQ) replaceConnection(ctx context.Context, previous quic.EarlyConnecti
 		d.mu.Unlock()
 		return c, nil
 	}
+	var staleConn quic.EarlyConnection
 	if d.connection != nil {
-		_ = d.connection.CloseWithError(0, "")
+		staleConn = d.connection
 		d.connection = nil
 	}
 	d.mu.Unlock()
+	// Close the old connection outside d.mu: CloseWithError sends a
+	// CONNECTION_CLOSE frame and must not stall concurrent ForwardDNS.
+	if staleConn != nil {
+		_ = staleConn.CloseWithError(0, "")
+	}
 
 	qc, err := d.createConnection(ctx)
 	if err != nil {
@@ -499,16 +583,19 @@ func (d *DoQ) replaceConnection(ctx context.Context, previous quic.EarlyConnecti
 
 func (d *DoQ) installConnection(qc quic.EarlyConnection) (quic.EarlyConnection, error) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.closed {
+		d.mu.Unlock()
 		_ = qc.CloseWithError(0, "")
 		return nil, net.ErrClosed
 	}
 	if d.connection != nil {
+		connection := d.connection
+		d.mu.Unlock()
 		_ = qc.CloseWithError(0, "")
-		return d.connection, nil
+		return connection, nil
 	}
 	d.connection = qc
+	d.mu.Unlock()
 	return qc, nil
 }
 
@@ -532,12 +619,14 @@ func (d *DoQ) createConnection(ctx context.Context) (quic.EarlyConnection, error
 
 func (d *DoQ) Close() error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.closed = true
-	if d.connection != nil {
-		err := d.connection.CloseWithError(0, "")
-		d.connection = nil
-		return err
+	conn := d.connection
+	d.connection = nil
+	d.mu.Unlock()
+	if conn != nil {
+		// CloseWithError may send a CONNECTION_CLOSE frame; keep d.mu free
+		// so concurrent ForwardDNS callers are not stalled behind it.
+		return conn.CloseWithError(0, "")
 	}
 	return nil
 }
@@ -550,6 +639,12 @@ type connPool struct {
 	maxConns int
 	index    atomic.Uint32
 	dialer   func(context.Context) (netproxy.Conn, error)
+	// closed marks the pool as torn down. get()'s slow path dials outside
+	// the lock; without this flag, close() can empty the pool mid-dial and
+	// the fresh connection would then be appended to a dead pool whose
+	// owner has already left, leaking the connection and its readLoop
+	// goroutine (which blocks on a deadline-less ReadFull).
+	closed bool
 }
 
 const connPoolScaleUpPendingThreshold int32 = 64
@@ -591,6 +686,10 @@ func (p *connPool) get(ctx context.Context) (*pipelinedConn, error) {
 slowPath:
 	// Slow path: clean up and decide whether to scale up.
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, errConnPoolClosed
+	}
 	p.pruneClosedLocked()
 
 	var selected *pipelinedConn
@@ -619,6 +718,13 @@ slowPath:
 
 	// Re-enter critical section: another goroutine may have filled pool while dialing.
 	p.mu.Lock()
+	if p.closed {
+		// The pool was torn down while we dialed. Nobody will ever close a
+		// connection appended now, so discard the fresh one here.
+		p.mu.Unlock()
+		conn.Close()
+		return nil, errConnPoolClosed
+	}
 	p.pruneClosedLocked()
 	if len(p.conns) >= p.maxConns {
 		if len(p.conns) > 0 {
@@ -657,7 +763,7 @@ func (p *connPool) pruneClosedLocked() {
 func (p *connPool) close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
+	p.closed = true
 	for _, conn := range p.conns {
 		conn.Close() // pipelinedConn.Close() has no return value
 	}
@@ -682,6 +788,16 @@ func (l *lazyConnPool) getOrInit(init func() *connPool) *connPool {
 		p := init()
 		l.pool.Store(p)
 	})
+	if l.closed.Load() {
+		// closePool raced the lazy initialization: it observed pool==nil
+		// before the Store above and skipped p.close(), so this freshly
+		// created pool would escape closure along with every connection
+		// readLoop inside it. Close it here (idempotent) and report closed.
+		if v := l.pool.Load(); v != nil {
+			_ = v.(*connPool).close()
+		}
+		return nil
+	}
 	if v := l.pool.Load(); v != nil {
 		return v.(*connPool)
 	}
@@ -876,6 +992,54 @@ const (
 	dnsUdpProxyPoolMaxIdleTime  = 10 * time.Second
 	dnsUdpDirectPoolMaxIdleTime = 30 * time.Second
 )
+
+// dnsUDPResponseSourceMismatchLogInterval rate-limits the source-mismatch
+// warning: an upstream behind a transport that synthesizes the sender address
+// would otherwise log on every reply.
+const dnsUDPResponseSourceMismatchLogInterval = time.Minute
+
+// Observe-only upstream source validation state. A mismatch is counted and
+// rate-limit logged, never dropped, until every transport dae can dial is known
+// to report a truthful datagram source (transports that synthesize the sender
+// address cannot be distinguished from a forged reply yet).
+var (
+	dnsUDPResponseSourceMismatchCount  atomic.Uint64
+	lastDnsUDPResponseSourceMismatchAt atomic.Int64
+)
+
+// udpResponseSourceMismatch reports whether a datagram's reported source
+// differs from the endpoint dae dialed. A transport that does not report a
+// source address at all yields an invalid address and is treated as unknown,
+// not as a mismatch.
+func udpResponseSourceMismatch(from, target netip.AddrPort) bool {
+	if !from.IsValid() || !target.IsValid() {
+		return false
+	}
+	// An IPv4-mapped IPv6 source (::ffff:a.b.c.d, as reported by a dual-stack
+	// socket) denotes the same endpoint as its plain IPv4 form. Comparing the
+	// raw values would flag every reply from such an upstream as a mismatch.
+	// netip.AddrPort has no Unmap, so unmap both addresses individually.
+	return from.Addr().Unmap() != target.Addr().Unmap() || from.Port() != target.Port()
+}
+
+func noteDnsUDPResponseSourceMismatch(log *logrus.Logger, target, from netip.AddrPort) {
+	dnsUDPResponseSourceMismatchCount.Add(1)
+	if log == nil {
+		return
+	}
+	nowNano := time.Now().UnixNano()
+	for {
+		last := lastDnsUDPResponseSourceMismatchAt.Load()
+		if nowNano-last < int64(dnsUDPResponseSourceMismatchLogInterval) {
+			return
+		}
+		if lastDnsUDPResponseSourceMismatchAt.CompareAndSwap(last, nowNano) {
+			break
+		}
+	}
+	log.Warnf("UDP DNS reply reported source %v but %v was dialed; the reply is still processed "+
+		"(observe-only source validation, mismatches=%d)", from, target, dnsUDPResponseSourceMismatchCount.Load())
+}
 
 func newUdpConnPool(maxIdle, maxActive int, dialer func(context.Context) (netproxy.Conn, error)) *udpConnPool {
 	if maxIdle <= 0 {
@@ -1183,7 +1347,7 @@ func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 	staleResponses := 0
 
 	for {
-		n, err := netutils.ReadUDPConn(conn, respBuf)
+		n, from, err := netutils.ReadUDPConnFrom(conn, respBuf)
 		if err != nil {
 			// Direct UDP sockets can usually survive a single DNS timeout, but a
 			// proxy-backed UDP timeout often means the relay-side session has gone
@@ -1193,8 +1357,7 @@ func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 				badConn = true
 				return nil, err
 			}
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
+			if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {
 				if d.profile.DiscardPooledConnOnTimeout {
 					udpPool.discard(conn)
 					badConn = true
@@ -1204,6 +1367,17 @@ func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 			udpPool.discard(conn)
 			badConn = true
 			return nil, err
+		}
+
+		// Observe-only upstream source validation: a datagram that claims to
+		// come from a different endpoint than the one dae dialed can only be a
+		// spoofed or cross-talked reply. The fix keeps observing for now -
+		// transports that synthesize the sender address (some proxy protocols)
+		// cannot be told apart from a forged one yet, and dropping on a
+		// false positive would break resolution - so the datagram is still
+		// processed, but the mismatch is counted and rate-limit logged.
+		if udpResponseSourceMismatch(from, d.dialArgument.bestTarget) {
+			noteDnsUDPResponseSourceMismatch(d.log, d.dialArgument.bestTarget, from)
 		}
 
 		if n < 2 {

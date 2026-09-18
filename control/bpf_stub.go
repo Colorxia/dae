@@ -176,7 +176,7 @@ func loadBpf() (*ebpf.CollectionSpec, error) {
 	return nil, errBpfObjectsUnavailable
 }
 
-func loadBpfObjects(_ interface{}, _ *ebpf.CollectionOptions) error {
+func loadBpfObjects(_ any, _ *ebpf.CollectionOptions) error {
 	return errBpfObjectsUnavailable
 }
 
@@ -232,7 +232,6 @@ type bpfMapSpecs struct {
 	RouteCtxScratchMap       *ebpf.MapSpec `ebpf:"route_ctx_scratch_map"`
 	RoutingHandoffMap        *ebpf.MapSpec `ebpf:"routing_handoff_map"`
 	RoutingMap               *ebpf.MapSpec `ebpf:"routing_map"`
-	RoutingEpochMap          *ebpf.MapSpec `ebpf:"routing_epoch_map"`
 	RoutingMetaMap           *ebpf.MapSpec `ebpf:"routing_meta_map"`
 	ConnStateMap             *ebpf.MapSpec `ebpf:"conn_state_map"`
 	UnusedLpmType            *ebpf.MapSpec `ebpf:"unused_lpm_type"`
@@ -277,7 +276,6 @@ type bpfMaps struct {
 	RouteCtxScratchMap       *ebpf.Map `ebpf:"route_ctx_scratch_map"`
 	RoutingHandoffMap        *ebpf.Map `ebpf:"routing_handoff_map"`
 	RoutingMap               *ebpf.Map `ebpf:"routing_map"`
-	RoutingEpochMap          *ebpf.Map `ebpf:"routing_epoch_map"`
 	RoutingMetaMap           *ebpf.Map `ebpf:"routing_meta_map"`
 	ConnStateMap             *ebpf.Map `ebpf:"conn_state_map"`
 	UnusedLpmType            *ebpf.Map `ebpf:"unused_lpm_type"`
@@ -306,7 +304,6 @@ func (m *bpfMaps) Close() error {
 		m.RouteCtxScratchMap,
 		m.RoutingHandoffMap,
 		m.RoutingMap,
-		m.RoutingEpochMap,
 		m.RoutingMetaMap,
 		m.ConnStateMap,
 		m.UnusedLpmType,
@@ -401,15 +398,19 @@ type bpfIfParams struct {
 }
 
 type loadBpfOptions struct {
-	PinPath                string
-	BigEndianTproxyPort    uint32
-	CollectionOptions      *ebpf.CollectionOptions
-	ConnStateMapMaxEntries uint32
-	DatapathGeneration     uint16
+	PinPath                    string
+	BigEndianTproxyPort        uint32
+	CollectionOptions          *ebpf.CollectionOptions
+	ConnStateMapMaxEntries     uint32
+	RedirectTrackMapMaxEntries uint32
+	DatapathGeneration         uint16
 }
 
 const (
 	defaultConnStateMapMaxEntries = 65536 * 4
+	// Mirrors MAX_REDIRECT_TRACK_NUM in kern/tproxy.c; see bpf_utils.go for
+	// the single-owner contract with tuneRedirectTrackMap.
+	defaultRedirectTrackMapMaxEntries = 65536
 )
 
 func fullLoadBpfObjects(
@@ -421,6 +422,12 @@ func fullLoadBpfObjects(
 	return errBpfObjectsUnavailable
 }
 
+// logRemovedIncompatiblePinnedMap has no counterpart in this build: the stub
+// loader never loads objects and never removes a pinned map, so the warning it
+// emits (bpf_utils.go) is unreachable here. The stub exists so the shared
+// source-contract tests that reference the symbol still compile.
+func logRemovedIncompatiblePinnedMap(_ *logrus.Logger, _, _ string) {}
+
 func BpfMapDeleteAll[K any, V any](m *ebpf.Map) error {
 	return errBpfObjectsUnavailable
 }
@@ -429,11 +436,11 @@ func BpfMapBatchDeleteAll[K any, V any](m *ebpf.Map) error {
 	return errBpfObjectsUnavailable
 }
 
-func BpfMapBatchDelete(m *ebpf.Map, keys interface{}) (n int, err error) {
+func BpfMapBatchDelete(m *ebpf.Map, keys any) (n int, err error) {
 	return 0, errBpfObjectsUnavailable
 }
 
-func BpfMapBatchUpdate(m *ebpf.Map, keys interface{}, values interface{}, opts *ebpf.BatchOptions) (n int, err error) {
+func BpfMapBatchUpdate(m *ebpf.Map, keys any, values any, opts *ebpf.BatchOptions) (n int, err error) {
 	return 0, errBpfObjectsUnavailable
 }
 
@@ -480,14 +487,33 @@ func tuneConnStateBpfMap(spec *ebpf.CollectionSpec, maxEntries uint32) error {
 	return nil
 }
 
-func customizeBpfMapSpecs(spec *ebpf.CollectionSpec, connStateMapMaxEntries uint32) error {
+func tuneRedirectTrackMap(spec *ebpf.CollectionSpec, maxEntries uint32) error {
+	if spec == nil {
+		return fmt.Errorf("nil collection spec")
+	}
+	if maxEntries == 0 {
+		maxEntries = defaultRedirectTrackMapMaxEntries
+	}
+	m, ok := spec.Maps["redirect_track"]
+	if !ok || m == nil {
+		return fmt.Errorf("missing map spec %q", "redirect_track")
+	}
+	if m.MaxEntries != maxEntries {
+		return fmt.Errorf("redirect_track capacity %d diverges from the expected %d (MAX_REDIRECT_TRACK_NUM in kern/tproxy.c and defaultRedirectTrackMapMaxEntries in bpf_utils.go must agree)",
+			m.MaxEntries, maxEntries)
+	}
+	m.MaxEntries = maxEntries
+	return nil
+}
+
+func customizeBpfMapSpecs(spec *ebpf.CollectionSpec, connStateMapMaxEntries, redirectTrackMapMaxEntries uint32) error {
 	if err := disablePinnedConnStateMaps(spec); err != nil {
 		return err
 	}
 	if err := tuneConnStateBpfMap(spec, connStateMapMaxEntries); err != nil {
 		return err
 	}
-	return nil
+	return tuneRedirectTrackMap(spec, redirectTrackMapMaxEntries)
 }
 
 func cleanupPinnedConnStateMapFiles(log *logrus.Logger, pinPath string) int {

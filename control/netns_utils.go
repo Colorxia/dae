@@ -30,12 +30,6 @@ const (
 	DaeVethTxQLen = 1000
 )
 
-// ptrToUint32 returns a pointer to the given uint32 value.
-// Used for netlink Rule.Mask field which requires *uint32.
-func ptrToUint32(v uint32) *uint32 {
-	return &v
-}
-
 var (
 	daeNetns     *DaeNetns
 	once         sync.Once
@@ -370,7 +364,10 @@ func (ns *DaeNetns) setupVethOrNetkit() (err error) {
 	}
 
 	// Fall back to veth
-	ns.log.Info("Falling back to veth device creation")
+	// The fallback itself is already reported by the Warn above (or by the
+	// kernel-version Info below when Netkit was never attempted); this line
+	// only adds the step to the debug trace.
+	ns.log.Debug("Falling back to veth device creation")
 	ns.useNetkit = false
 	if err := ns.setupVeth(); err != nil {
 		return fmt.Errorf("failed to create veth device: %w", err)
@@ -400,7 +397,10 @@ func (ns *DaeNetns) tryCreateNetkit() (err error) {
 	// CVE-2025-37959 fix (checked by the loader at BPF load time).
 	ns.log.Debugf("Creating Netkit device pair: %s <-> %s", HostVethName, NsVethName)
 	if err := createNetkitDevice(ns.log, HostVethName, NsVethName, DaeVethTxQLen, true); err != nil {
-		ns.log.Infof("createNetkitDevice failed: %v", err)
+		// The wrapped error is reported (with its cause) by setupVethOrNetkit
+		// and, on a real failure, by the caller of DaeNetns setup. Logging it
+		// here as well would print the same failure twice per level.
+		ns.log.Debugf("createNetkitDevice failed: %v", err)
 		return fmt.Errorf("failed to create Netkit device: %w", err)
 	}
 	ns.log.Debug("Netkit device created successfully")
@@ -408,14 +408,17 @@ func (ns *DaeNetns) tryCreateNetkit() (err error) {
 	// Get link references
 	ns.log.Debugf("Getting link reference for %s", HostVethName)
 	if ns.dae0, err = netlink.LinkByName(HostVethName); err != nil {
-		ns.log.Errorf("Failed to get link %s: %v", HostVethName, err)
+		// The returned error carries this cause (%w) and is reported once by
+		// the caller of DaeNetns setup (With/WithRequired -> the serve loop),
+		// so the inner line only adds the same failure a second time.
+		ns.log.Debugf("Failed to get link %s: %v", HostVethName, err)
 		return fmt.Errorf("failed to get link dae0: %w", err)
 	}
 	ns.log.Debug("Got link reference for dae0")
 
 	ns.log.Debugf("Getting link reference for %s", NsVethName)
 	if ns.dae0peer, err = netlink.LinkByName(NsVethName); err != nil {
-		ns.log.Errorf("Failed to get link %s: %v", NsVethName, err)
+		ns.log.Debugf("Failed to get link %s: %v", NsVethName, err)
 		return fmt.Errorf("failed to get link dae0peer: %w", err)
 	}
 	ns.log.Debug("Got link reference for dae0peer")
@@ -431,7 +434,7 @@ func (ns *DaeNetns) tryCreateNetkit() (err error) {
 	// Set link up
 	ns.log.Debug("Setting link dae0 up")
 	if err = netlink.LinkSetUp(ns.dae0); err != nil {
-		ns.log.Errorf("Failed to set link dae0 up: %v", err)
+		ns.log.Debugf("Failed to set link dae0 up: %v", err)
 		return fmt.Errorf("failed to set link dae0 up: %w", err)
 	}
 	ns.log.Debug("Netkit device setup completed successfully")
@@ -442,33 +445,84 @@ func (ns *DaeNetns) tryCreateNetkit() (err error) {
 func (ns *DaeNetns) setup() (err error) {
 	ns.log.Trace("setting up dae netns")
 
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	if ns.hostNs, err = netns.Get(); err != nil {
+	// Capture the host namespace on the caller's thread before spawning the
+	// worker below: goroutines may start on any OS thread, and the setup
+	// steps switch namespaces, so the worker needs an explicit host reference
+	// to start from and restore into.
+	hostNs, err := netns.Get()
+	if err != nil {
 		return fmt.Errorf("failed to get host netns: %w", err)
 	}
-	defer func() { _ = netns.Set(ns.hostNs) }()
+	ns.hostNs = hostNs // persistent handle; released by Close
 
-	if err = ns.setupVethOrNetkit(); err != nil {
-		return
+	type setupResult struct {
+		err        error
+		panicValue any
 	}
-	if err = ns.setupNetns(); err != nil {
-		return
+	resultCh := make(chan setupResult, 1)
+	go func() {
+		runtime.LockOSThread()
+		var setupErr error
+		restored := false
+		defer func() {
+			panicValue := recover()
+			if restored {
+				runtime.UnlockOSThread()
+			} else if restoreErr := setNetnsFunc(hostNs); restoreErr != nil {
+				// Last authoritative restore attempt. If it fails (e.g.
+				// setns(2) ENOMEM), keep the thread locked and exit: a
+				// goroutine that exits while still locked makes the runtime
+				// discard its OS thread, quarantining a thread that would
+				// otherwise run arbitrary code in the dae namespace.
+				ns.log.WithError(restoreErr).Errorln("Failed to restore host netns after dae netns setup; quarantining setup thread")
+				setupErr = stderrors.Join(setupErr, fmt.Errorf("failed to restore host netns: %w", restoreErr))
+			} else {
+				runtime.UnlockOSThread()
+			}
+			resultCh <- setupResult{err: setupErr, panicValue: panicValue}
+		}()
+
+		// Start deterministically in the host namespace regardless of which
+		// OS thread the scheduler picked for this goroutine. This is the
+		// setup's namespace prerequisite: without it the destructive link
+		// setup below would run in whatever namespace the worker thread was
+		// in. Fail closed instead of continuing (the deferred restore above
+		// also publishes the error before the caller waits on resultCh).
+		if setupErr = setNetnsFunc(hostNs); setupErr != nil {
+			setupErr = fmt.Errorf("failed to switch setup thread to host netns: %w", setupErr)
+			return
+		}
+
+		if setupErr = ns.setupVethOrNetkit(); setupErr != nil {
+			return
+		}
+		if setupErr = ns.setupNetns(); setupErr != nil {
+			return
+		}
+		if setupErr = ns.setupSysctl(); setupErr != nil {
+			return
+		}
+		if setupErr = ns.setupIPv4Datapath(); setupErr != nil {
+			return
+		}
+		if setupErr = ns.setupIPv6Datapath(); setupErr != nil {
+			return
+		}
+		if setupErr = ns.setupRoutingPolicy(); setupErr != nil {
+			return
+		}
+		// Success: re-enter the host namespace on this worker before it is
+		// released back to the scheduler.
+		if setupErr = setNetnsFunc(hostNs); setupErr == nil {
+			restored = true
+		}
+	}()
+
+	res := <-resultCh
+	if res.panicValue != nil {
+		panic(res.panicValue)
 	}
-	if err = ns.setupSysctl(); err != nil {
-		return
-	}
-	if err = ns.setupIPv4Datapath(); err != nil {
-		return
-	}
-	if err = ns.setupIPv6Datapath(); err != nil {
-		return
-	}
-	if err = ns.setupRoutingPolicy(); err != nil {
-		return
-	}
-	return
+	return res.err
 }
 
 func (ns *DaeNetns) setupRoutingPolicy() (err error) {
@@ -527,7 +581,7 @@ func (ns *DaeNetns) setupRoutingPolicy() (err error) {
 		Family:            unix.AF_INET,
 		Table:             table,
 		Mark:              consts.TproxyMark,
-		Mask:              ptrToUint32(consts.TproxyMark),
+		Mask:              new(consts.TproxyMark),
 	}, {
 		SuppressIfgroup:   -1,
 		SuppressPrefixlen: -1,
@@ -537,7 +591,7 @@ func (ns *DaeNetns) setupRoutingPolicy() (err error) {
 		Family:            unix.AF_INET6,
 		Table:             table,
 		Mark:              consts.TproxyMark,
-		Mask:              ptrToUint32(consts.TproxyMark),
+		Mask:              new(consts.TproxyMark),
 	}}
 
 	for _, rule := range rules {

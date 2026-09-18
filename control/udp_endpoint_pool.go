@@ -27,10 +27,12 @@ var (
 )
 
 // udpEndpointCreateShardCount is the number of sharded mutexes that guard
-// concurrent endpoint creation. 64 shards provide near-zero contention even
-// under high concurrent-create rates.
+// concurrent endpoint creation. Because a creation lock is held across the
+// dial (up to DefaultDialTimeout), unrelated keys hashing to the same shard
+// queue behind it; a larger shard count keeps
+// that head-of-line blocking negligible under high concurrent-create rates.
 const (
-	udpEndpointCreateShardCount      = 64
+	udpEndpointCreateShardCount      = 1024
 	udpEndpointJanitorInterval       = 250 * time.Millisecond
 	udpEndpointJanitorMaxInterval    = 30 * time.Second
 	udpEndpointPendingReplyPeerLimit = 8
@@ -41,7 +43,6 @@ type UdpHandler func(ue *UdpEndpoint, data []byte, from netip.AddrPort) error
 
 type udpConnStateOwner interface {
 	RetainUdpConnStateTuples(keys []bpfTuplesKey)
-	TransferRetainedUdpConnStateTuplesFrom(previous udpConnStateOwner, keys []bpfTuplesKey)
 	ReleaseUdpConnStateTuples(keys []bpfTuplesKey) error
 }
 
@@ -143,6 +144,20 @@ type UdpEndpoint struct {
 	drainRelease          func()
 
 	log *logrus.Logger
+
+	// sentReporter, when non-nil, owns the upload accounting and traffic health
+	// reporting for datagrams this endpoint hands to the batch aggregator:
+	// WriteTo only queues them, so the caller cannot report them at submission
+	// time. It is invoked with the endpoint, the number of datagrams actually
+	// handed to the transport, and their payload bytes, and only when that
+	// count is > 0. Nil for non-batched endpoints (the caller reports inline)
+	// and for endpoints built without a control plane (tests, pool-only use).
+	sentReporter func(sent *UdpEndpoint, datagrams int, bytes int)
+
+	// batchFlushFailureCount counts failed asynchronous flushes. The flush runs
+	// off the caller's stack, so without this counter (and its rate-limited
+	// warn) a failing batched transport was completely invisible.
+	batchFlushFailureCount atomic.Uint64
 
 	dead   atomic.Bool
 	failed atomic.Bool
@@ -292,6 +307,10 @@ type UdpEndpointOptions struct {
 	// process-owned session lifecycle before it is published in the pool.
 	sessionManager *SessionManager
 	egressRuntime  *egressRuntime
+	// SentReporter reports datagrams actually sent by the batch aggregator,
+	// which is the only place that knows the real sent count. Nil keeps the
+	// caller-side inline accounting (non-batched endpoints).
+	SentReporter func(sent *UdpEndpoint, datagrams int, bytes int)
 }
 
 var DefaultUdpEndpointPool = NewUdpEndpointPool()
@@ -709,6 +728,7 @@ dialSuccess:
 	if udpWriteBatchOptedIn() {
 		if _, ok := packetConn.(netproxy.PacketBatchWriter); ok {
 			ue.writeBatch = newUDPWriteBatchAggregator(ue)
+			ue.sentReporter = createOption.SentReporter
 		}
 	}
 	if createOption.sessionManager != nil {
@@ -875,10 +895,19 @@ func (p *UdpEndpointPool) GetOrCreate(key UdpEndpointKey, createOption *UdpEndpo
 	shard.mu.RUnlock()
 
 	// Slow path: serialize creation for the same key using a creation shard lock.
-	shard.createMu.Lock()
-	defer shard.createMu.Unlock()
-
 	var staleToClose *UdpEndpoint
+	shard.createMu.Lock()
+	createMuLocked := true
+	defer func() {
+		// GetOrCreate is called from panic-recovering packet workers. Preserve
+		// unlock and stale cleanup on unwind so one panic cannot strand this shard.
+		if createMuLocked {
+			shard.createMu.Unlock()
+		}
+		if staleToClose != nil {
+			_ = staleToClose.Close()
+		}
+	}()
 	shard.mu.Lock()
 	ue, ok = shard.pool[key]
 	if ok {
@@ -895,12 +924,18 @@ func (p *UdpEndpointPool) GetOrCreate(key UdpEndpointKey, createOption *UdpEndpo
 		}
 	}
 	shard.mu.Unlock()
-	if staleToClose != nil {
-		_ = staleToClose.Close()
-	}
 
 	// Create a new endpoint under the creation lock.
 	newUe, createErr := p.createEndpointLocked(key, createOption)
+	shard.createMu.Unlock()
+	createMuLocked = false
+
+	// Close the stale endpoint outside createMu: Close waits on the
+	// transport receiver and must not extend the shard-wide creation hold.
+	if staleToClose != nil {
+		_ = staleToClose.Close()
+		staleToClose = nil
+	}
 	if createErr != nil {
 		return nil, true, createErr
 	}

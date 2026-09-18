@@ -142,7 +142,10 @@ type Dns struct {
 	Bind               string          `mapstructure:"bind"`
 	OptimisticCache    bool            `mapstructure:"optimistic_cache" default:"true"`
 	OptimisticCacheTtl int             `mapstructure:"optimistic_cache_ttl" default:"60"`
-	MaxCacheSize       int             `mapstructure:"max_cache_size" default:"65536"`
+	// OptimisticStaleReplyTtl bounds the TTL advertised when a stale (RFC
+	// 8767) response is served. 0 keeps the previously packed TTL.
+	OptimisticStaleReplyTtl int `mapstructure:"optimistic_stale_reply_ttl" default:"30"`
+	MaxCacheSize            int `mapstructure:"max_cache_size" default:"65536"`
 }
 
 type Routing struct {
@@ -196,7 +199,15 @@ func New(sections []*config_parser.Section) (conf *Config, err error) {
 	for _, spec := range configSectionSpecs {
 		section, ok := nameToSection[spec.name]
 		if !ok {
-			continue
+			// Optional section that the user did not write. It must still be
+			// decoded from an empty section, otherwise the documented
+			// `default:` tags on its fields never run and the whole section
+			// silently keeps its Go zero values (e.g. a missing dns section
+			// left MaxCacheSize == 0, which means "unlimited" rather than the
+			// documented default). Decoding an empty section only applies
+			// defaults and required-param checks; it never invents a value for
+			// a field the user did provide.
+			section = &Section{Val: &config_parser.Section{Name: spec.name}}
 		}
 		if err := decodeConfigSection(conf, spec.name, section.Val); err != nil {
 			return nil, fmt.Errorf("failed to parse \"%v\": %w", spec.name, err)

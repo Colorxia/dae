@@ -7,14 +7,14 @@ require (
 	github.com/antlr/antlr4/runtime/Go/antlr/v4 v4.0.0-20230305170008-8188dc5388df
 	github.com/cilium/ebpf v0.22.0
 	github.com/daeuniverse/dae-config-dist/go/dae_config v0.0.0-20230604120805-1c27619b592d
-	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260827065003-9e1febf4f794
+	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260911162531-896954f65c52
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mholt/archives v0.1.5
 	github.com/miekg/dns v1.1.72
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac
-	github.com/olicesx/quic-go v0.0.0-20260831031827-fbf90cb0a47d
+	github.com/olicesx/quic-go v0.0.0-20260910141758-62d80bbebb5b
 	github.com/panjf2000/ants/v2 v2.11.5
 	github.com/safchain/ethtool v0.7.0
 	github.com/shirou/gopsutil/v4 v4.26.1
@@ -62,7 +62,7 @@ require (
 	github.com/minio/minlz v1.0.1 // indirect
 	github.com/nwaples/rardecode/v2 v2.2.0 // indirect
 	github.com/oklog/ulid/v2 v2.1.1 // indirect
-	github.com/olicesx/qpack v0.0.0-20260831031549-0844ed36f1cd // indirect
+	github.com/olicesx/qpack v0.6.1-0.20260910092525-3d8903e3255f // indirect
 	github.com/onsi/ginkgo/v2 v2.28.1 // indirect
 	github.com/pierrec/lz4/v4 v4.1.25 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
@@ -115,12 +115,21 @@ require (
 // control, and explicit-transport address behavior. Performance and security
 // claims are enforced in the fork's own unit/race gates; no GC behavior is
 // inferred from pool implementation choice here.
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260831031827-fbf90cb0a47d
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260910141758-62d80bbebb5b
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
 
 // Remote outbound fork: Trojan UDP CRLF, sticky role-header dispatch,
 // scoped h2 MarkDead, 8KiB direct small-tier, TUIC stream-parse bench,
-// and protocol lifecycle/framing/short-write hardening.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260901074714-c3d799e1815d
+// and protocol lifecycle/framing/short-write hardening. Adds AnyTLS
+// remote-FIN data preservation, gRPC zero-deadline clearing, and
+// chain-constructed dialer ownership. Includes cancellable dial queues,
+// immediate TUIC retirement signals, and explicit write-deadline behavior.
+// Now also: symmetric-direct WriteMsgUDP keeps OOB cmsgs (QUIC GSO),
+// bbr3 low-RTT pacing-cwnd deadlock broken with a CwndGain-scaled
+// pacing-support floor, STARTUP no longer aborts on background loss,
+// and hy2 defaults to bbr3 again. TLS records are coalesced into one socket
+// write per burst across anytls and the shared tls/ws transports (-35% to
+// -52% write syscalls measured on trojan and trojan-wss relay paths).
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260917223728-6a44445c9106

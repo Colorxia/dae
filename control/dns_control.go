@@ -48,6 +48,15 @@ var (
 	ErrDNSQueryConcurrencyLimitExceeded = errors.New("dns query concurrency limit exceeded")
 	ErrDNSUDPConnPoolExhausted          = errors.New("dns udp conn pool exhausted")
 	ErrDNSTruncated                     = errors.New("dns response truncated")
+	// ErrDnsForwardersClosed is returned when a forwarder is requested after
+	// the controller's forwarder cache has been swept by Close. In-flight
+	// queries that outlived the close handle-gate must fail instead of
+	// repopulating forwarders that nothing will ever close again.
+	ErrDnsForwardersClosed = errors.New("dns forwarder cache is closed")
+	// errConnPoolClosed is returned when a pooled connection is requested
+	// after the pool has been closed; the fresh dial is discarded instead of
+	// being appended to a dead pool.
+	errConnPoolClosed = errors.New("dns connection pool is closed")
 )
 
 var (
@@ -79,22 +88,51 @@ type DnsControllerOption struct {
 	ConcurrencyLimit      int
 	OptimisticCache       bool
 	OptimisticCacheTtl    int // 0 means never expire (rely on LRU eviction)
-	MaxCacheSize          int // maximum number of cache entries (0 = unlimited)
+	// OptimisticStaleReplyTtl bounds the TTL advertised for served-stale
+	// answers (RFC 8767); 0 keeps the previously packed TTL.
+	OptimisticStaleReplyTtl int
+	MaxCacheSize            int // maximum number of cache entries (0 = unlimited)
 }
 
 type dnsControllerStore struct {
 	// dnsCache uses sync.Map for lock-free concurrent access
-	dnsCache       sync.Map // map[string]*DnsCache
-	dnsCacheSize   atomic.Int64
-	dnsKnowledge   sync.Map // map[string]int64 (base cache key -> original deadline unix nano)
-	dnsKnowledgeMu sync.Mutex
+	dnsCache     sync.Map // map[string]*DnsCache
+	dnsCacheSize atomic.Int64
+	// dnsCacheByBase indexes the exact cache keys stored under each base cache
+	// key (map[string]*dnsCacheKeySet). It lets family removal and knowledge
+	// resync touch only the affected family instead of walking the whole cache
+	// while holding cacheProjectionMu. It is maintained exclusively by
+	// storeDnsCache, loadAndDeleteDnsCache and compareAndDeleteDnsCache (plus
+	// Close, which drops it wholesale), and the janitor reconciles it against
+	// dnsCacheSize so drift is reported instead of silently disabling family
+	// removal.
+	dnsCacheByBase sync.Map
+	// dnsCacheIndexReconciles counts janitor runs that found the base-key index
+	// out of sync with the live cache and rebuilt it.
+	dnsCacheIndexReconciles atomic.Uint64
+	// dnsCacheStoreFailureAlert paces the report of DNS responses that could
+	// not be stored in the cache. Caching is a latency optimization - the
+	// response has already been sent to the client - so one line per query
+	// reports a working DNS path as if it were an outage; the paced line
+	// carries the number of failed stores so the repeats stay visible. It
+	// lives on the shared store because the per-query entry points run on both
+	// the owning controller and its reload facades, which must share one pace
+	// and one count.
+	dnsCacheStoreFailureAlert pacedAlert
+	dnsKnowledge              sync.Map // map[string]int64 (base cache key -> original deadline unix nano)
+	dnsKnowledgeMu            sync.Mutex
 	// runtimeState owns the complete immutable runtime and behavior snapshot so
 	// one load cannot combine fields from different reload generations.
 	runtimeState      atomic.Pointer[dnsControllerRuntimeState]
 	runtimeMu         sync.RWMutex // Serializes runtime publication with reload cache projection.
 	cacheProjectionMu sync.RWMutex // Serializes cache membership with BPF projection callbacks.
 	dnsForwarderCache sync.Map     // map[dnsForwarderKey]*cachedDnsForwarder
-	sf                singleflight.Group
+	// dnsForwardersClosed is set before closeAllDnsForwarders sweeps the
+	// cache. getOrCreateDnsForwarder re-checks it after a store so an
+	// in-flight query admitted before the close handle-gate expired cannot
+	// repopulate a forwarder that nothing will ever sweep or close again.
+	dnsForwardersClosed atomic.Bool
+	sf                  singleflight.Group
 
 	janitorStop  chan struct{}
 	janitorDone  chan struct{}
@@ -120,6 +158,31 @@ type dnsControllerStore struct {
 	// When ip_version_prefer is set, non-preferred responses wait briefly
 	// for preferred responses to arrive (RFC 8305 Happy Eyeballs).
 	prefWaitRegistry *preferenceWaitRegistry
+	// dnsPreferWaitNotified counts resolution-delay waits released by a
+	// preferred (A/AAAA) answer; dnsPreferWaitTimeout counts waits that ran to
+	// their full RFC 8305 delay without one; dnsPreferFiltered counts the
+	// answers an already-known preferred family replaced with an empty reply
+	// (the ipversion_prefer filter) plus the cached non-preferred entries that
+	// filter dropped.
+	dnsPreferWaitNotified atomic.Uint64
+	dnsPreferWaitTimeout  atomic.Uint64
+	dnsPreferFiltered     atomic.Uint64
+
+	// Truncated-answer bookkeeping (RFC 7766 §5). Upgrades count UDP answers
+	// whose TC=1 bit triggered a TCP retry and whether that retry produced an
+	// answer; ClientReplies counts TC=1 answers handed back to a client because
+	// no TCP upgrade delivered the full answer. The lastReported* copies hold
+	// the values the janitor published last, so the periodic summary can report
+	// an interval rate instead of a lifetime total only; they are written by
+	// the single DNS cache janitor goroutine (startDnsCacheJanitor) and are
+	// atomic only so a future reader cannot introduce a data race.
+	dnsUdpTruncatedUpgrades        atomic.Uint64
+	dnsUdpTruncatedUpgradeFailures atomic.Uint64
+	dnsTruncatedRepliesToClient    atomic.Uint64
+	lastDnsTruncatedLogTime        atomic.Int64
+	lastReportedTruncatedUpgrades  atomic.Uint64
+	lastReportedTruncatedFailures  atomic.Uint64
+	lastReportedTruncatedReplies   atomic.Uint64
 
 	// handleGate accounts for request handlers that entered through the
 	// active-plane dispatch. The publication RWMutex used to be held across
@@ -341,6 +404,7 @@ func (c *DnsController) Close() error {
 		return true
 	})
 	c.dnsCacheSize.Store(0)
+	c.clearDnsCacheIndex()
 	c.cacheProjectionMu.Unlock()
 	c.dnsKnowledge.Range(func(key, value any) bool {
 		c.dnsKnowledge.Delete(key)

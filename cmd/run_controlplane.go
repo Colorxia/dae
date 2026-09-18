@@ -14,7 +14,6 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
-	"runtime"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -162,32 +161,6 @@ func configureGcMemoryLimit(log *logrus.Logger) {
 	}
 }
 
-// configureGOMAXPROCS pins the Go scheduler to a single P by default. On the
-// few-core relay boxes dae targets, cross-P work stealing and netpoll handoffs
-// around the per-packet QUIC receive path cost more CPU than the parallelism
-// buys: on a 2-core box, GOMAXPROCS=1 cut proxied-relay CPU roughly in half at
-// identical throughput (measured 23.6 -> ~13 CPU-seconds per 45s of ~14MB/s
-// relay). The userspace relay stays well under one core, and direct traffic
-// bypasses userspace via the eBPF fast path, so a single P is not a
-// bottleneck; Go's asynchronous preemption keeps head-of-line delays bounded
-// if a bulk burst monopolizes the P.
-//
-// An explicit GOMAXPROCS environment variable always wins, preserving the
-// escape hatch for deployments that can actually saturate a core (e.g. many
-// parallel proxy nodes).
-func configureGOMAXPROCS(log *logrus.Logger) {
-	if value, ok := os.LookupEnv("GOMAXPROCS"); ok {
-		if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
-			log.Debugf("GOMAXPROCS: using explicit environment value %q", value)
-		}
-		return
-	}
-	runtime.GOMAXPROCS(1)
-	if log != nil {
-		log.Infoln("Configured GOMAXPROCS=1 (set GOMAXPROCS in the service environment to override)")
-	}
-}
-
 func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
 	// Deep copy to prevent modification.
 	conf = deepcopy.Copy(conf).(*config.Config)
@@ -195,6 +168,13 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 		var autoSelected bool
 		conf.Global.SoMarkFromDae, autoSelected = common.ResolveSoMarkFromDae(conf.Global.SoMarkFromDae, conf.Global.SoMarkFromDaeSet)
 		if autoSelected {
+			// This is the reachable, user-visible report of the auto-selected
+			// mark: every control-plane build goes through this function
+			// (startup and both reload paths), and it resolves the mark before
+			// control.NewControlPlane sees the config. The same warning exists
+			// in control.NewControlPlane as a defensive guard for callers that
+			// bypass cmd; with this resolution upstream its autoSelected branch
+			// is unreachable from the daemon, so it double-reports nothing.
 			log.Warnf("so_mark_from_dae is unset; using internal socket mark %#x to prevent dae UDP self-capture", conf.Global.SoMarkFromDae)
 		}
 	}
@@ -253,42 +233,15 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 			Timeout: epo,
 		}
 		log.Infoln("Waiting for network...")
-		attempts := 0
-		for i := 0; ; i++ {
-			attempts = i + 1
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			default:
-			}
-
-			resp, err := client.Get(CheckNetworkLinks[i%len(CheckNetworkLinks)])
-			if err != nil {
-				log.Debugln("CheckNetwork:", err)
-				var neterr net.Error
-				if errors.As(err, &neterr) && neterr.Timeout() {
-					// Do not sleep.
-					continue
-				}
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(epo):
-				}
-				continue
-			}
-			_ = resp.Body.Close()
-			if resp.StatusCode >= 200 && resp.StatusCode < 500 {
-				break
-			}
-			log.Infof("Bad status: %v (%v)", resp.Status, resp.StatusCode)
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(epo):
-			}
+		attempts, online, err := waitForNetworkOnline(ctx, &client, log, CheckNetworkLinks, epo, networkWaitTimeout)
+		if err != nil {
+			return nil, err
 		}
-		log.Infoln("Network online.")
+		if online {
+			log.Infoln("Network online.")
+		} else {
+			log.Warnf("Network still unreachable after %v (%d attempt(s)); resolving subscriptions anyway so local nodes keep working. Check the network, or set disable_waiting_network: true to skip this wait.", networkWaitTimeout, attempts)
+		}
 		log.Infof("Network check took %v (%d attempt(s))", time.Since(networkWaitStart), attempts)
 	}
 	if len(conf.Subscription) > 0 {
@@ -400,6 +353,21 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	}
 
 	if len(conf.Global.LanInterface) == 0 && len(conf.Global.WanInterface) == 0 {
+		// Deliberately warn, not error, and this is a decision with a stated
+		// invalidation condition: dae binds interfaces lazily. bindLan/bindWan
+		// register a pattern with the InterfaceManager and attach whenever a
+		// matching link appears (see controlPlaneCore.logBindOutcome), so
+		// "no interface at this instant" is recoverable - a container whose
+		// veth is created after dae starts, or a WAN link that appears when
+		// the modem comes up, would be reported as a fatal startup error while
+		// the daemon would in fact have bound it moments later.
+		//
+		// This must become an error if that lazy path ever stops delivering
+		// link events for a configured pattern (for example if the interface
+		// subscription is removed, or if a caller can reach this point with an
+		// empty LanInterface while no lan_interface default exists), because
+		// then "no interface" really is permanent and dae would run with an
+		// empty datapath instead of failing closed.
 		log.Warnln("No interface to bind.")
 	}
 

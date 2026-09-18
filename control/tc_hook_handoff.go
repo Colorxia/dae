@@ -6,6 +6,7 @@
 package control
 
 import (
+	stderrors "errors"
 	"fmt"
 	"sync"
 )
@@ -147,14 +148,14 @@ func (c *controlPlaneCore) restorePreparedTCHookSet(previous *controlPlaneCore) 
 	return nil
 }
 
-func (c *controlPlaneCore) beginTCHookReplace() (bool, error) {
+func (c *controlPlaneCore) beginTCHookReplace() error {
 	if c == nil {
-		return false, nil
+		return nil
 	}
 	c.tcHookMu.Lock()
 	if c.tcHookStage != nil {
 		c.tcHookMu.Unlock()
-		return false, fmt.Errorf("TC HookSet staging already active")
+		return fmt.Errorf("TC HookSet staging already active")
 	}
 	target := c.tcHooks
 	deferred := false
@@ -172,9 +173,9 @@ func (c *controlPlaneCore) beginTCHookReplace() (bool, error) {
 
 	if err := target.beginReplace(); err != nil {
 		c.clearTCHookStage(target)
-		return false, err
+		return err
 	}
-	return deferred, nil
+	return nil
 }
 
 func (c *controlPlaneCore) stageTCHook(spec tcHookSpec) error {
@@ -223,6 +224,17 @@ func (c *controlPlaneCore) commitTCHookReplace() error {
 		return nil
 	}
 	if err := stage.commit(); err != nil {
+		// Resolve the transaction here before dropping the stage pointer:
+		// the deferred abortTCHookReplace below the failure path reads
+		// tcHookStage, so once cleared it becomes a no-op and a partial
+		// transaction would stay wedged in the active set — rejecting every
+		// later upsert/beginReplace until restart. abort() re-applies the
+		// pre-transaction snapshot for a partial commit (see tcHookSet) and
+		// is a harmless no-op when the internal restore already converged.
+		if abortErr := stage.abort(); abortErr != nil {
+			c.log.Errorf("abort TC hook stage after failed commit: %v", abortErr)
+			err = stderrors.Join(err, abortErr)
+		}
 		c.clearTCHookStage(stage)
 		return err
 	}

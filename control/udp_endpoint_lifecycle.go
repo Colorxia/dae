@@ -20,6 +20,7 @@ import (
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/common/errors"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/sirupsen/logrus"
 )
 
@@ -75,47 +76,81 @@ func (ue *UdpEndpoint) setFlowBinding(binding UdpFlowBinding) {
 	ue.flowBindingSet = true
 }
 
+// TrackUdpConnStateTuplePair keeps this endpoint's conn_state tuples pinned for
+// the tuple pair it currently serves.
+//
+// The tracked set MOVES with the pair: a pair change releases the previous
+// pair's keys that the new pair does not use. Accumulating them instead (the
+// previous behavior) leaked one pin per observed pair for the endpoint's whole
+// lifetime, so a long-lived endpoint could pin an unbounded set of long-dead
+// tuples against the janitor. ReleaseUdpConnStateTuples deletes the kernel
+// entry only when the shared refcount reaches zero, so a tuple another endpoint
+// (or another flow) still pins survives the move.
+//
+// Lock order: udpConnStateMu protects the tuple set and the last-pair snapshot
+// together; it is never held while calling into the owner (Retain/Release take
+// udpStateMu downstream), matching releaseTrackedUdpConnState.
 func (ue *UdpEndpoint) TrackUdpConnStateTuplePair(src, dst netip.AddrPort) {
 	if ue == nil || !src.IsValid() || !dst.IsValid() {
 		return
 	}
-	if ue.udpConnStateLastPair.Load().matches(src, dst) {
-		return
-	}
-
 	forward := bpfTuplesKeyFromAddrPorts(src, dst, uint8(syscall.IPPROTO_UDP))
 	reverse := bpfTuplesKeyFromAddrPorts(dst, src, uint8(syscall.IPPROTO_UDP))
 
 	ue.udpConnStateMu.Lock()
-	defer ue.udpConnStateMu.Unlock()
-
-	if ue.udpConnStateClosed || ue.udpConnStateOwner == nil {
+	if ue.udpConnStateClosed {
+		ue.udpConnStateMu.Unlock()
+		return
+	}
+	owner := ue.udpConnStateOwner
+	if owner == nil {
+		ue.udpConnStateMu.Unlock()
+		return
+	}
+	// Swap publishes the new pair and hands back the previous one atomically
+	// with respect to the pin bookkeeping below.
+	previous := ue.udpConnStateLastPair.Swap(&udpConnStateTuplePairSnapshot{src: src, dst: dst})
+	if previous.matches(src, dst) {
+		ue.udpConnStateMu.Unlock()
 		return
 	}
 	if ue.udpConnStateTuples == nil {
 		ue.udpConnStateTuples = make(map[bpfTuplesKey]struct{}, 4)
 	}
-	forwardNew := false
-	if _, ok := ue.udpConnStateTuples[forward]; !ok {
-		ue.udpConnStateTuples[forward] = struct{}{}
-		forwardNew = true
-	}
-	reverseNew := false
-	if _, ok := ue.udpConnStateTuples[reverse]; !ok {
-		ue.udpConnStateTuples[reverse] = struct{}{}
-		reverseNew = true
-	}
-	if forwardNew || reverseNew {
-		switch {
-		case forwardNew && reverseNew:
-			newKeys := [2]bpfTuplesKey{forward, reverse}
-			ue.udpConnStateOwner.RetainUdpConnStateTuples(newKeys[:])
-		case forwardNew:
-			ue.udpConnStateOwner.RetainUdpConnStateTuples([]bpfTuplesKey{forward})
-		default:
-			ue.udpConnStateOwner.RetainUdpConnStateTuples([]bpfTuplesKey{reverse})
+	var retain []bpfTuplesKey
+	for _, key := range [2]bpfTuplesKey{forward, reverse} {
+		if _, ok := ue.udpConnStateTuples[key]; !ok {
+			ue.udpConnStateTuples[key] = struct{}{}
+			retain = append(retain, key)
 		}
-		ue.udpConnStateLastPair.Store(&udpConnStateTuplePairSnapshot{src: src, dst: dst})
+	}
+	var release []bpfTuplesKey
+	if previous != nil {
+		for _, key := range [2]bpfTuplesKey{
+			bpfTuplesKeyFromAddrPorts(previous.src, previous.dst, uint8(syscall.IPPROTO_UDP)),
+			bpfTuplesKeyFromAddrPorts(previous.dst, previous.src, uint8(syscall.IPPROTO_UDP)),
+		} {
+			if key == forward || key == reverse {
+				// Still part of the pair this endpoint serves.
+				continue
+			}
+			if _, held := ue.udpConnStateTuples[key]; !held {
+				continue
+			}
+			delete(ue.udpConnStateTuples, key)
+			release = append(release, key)
+		}
+	}
+	ue.udpConnStateMu.Unlock()
+
+	if len(retain) > 0 {
+		owner.RetainUdpConnStateTuples(retain)
+	}
+	if len(release) > 0 {
+		if err := owner.ReleaseUdpConnStateTuples(release); err != nil &&
+			ue.log != nil && ue.log.IsLevelEnabled(logrus.DebugLevel) {
+			ue.log.WithError(err).Debug("[UdpEndpoint] Failed to release superseded UDP conn-state tuples")
+		}
 	}
 }
 
@@ -277,8 +312,7 @@ func (ue *UdpEndpoint) isConnectionRefused(err error) bool {
 	if stderrors.Is(err, syscall.ECONNREFUSED) || stderrors.Is(err, syscall.EHOSTUNREACH) {
 		return true
 	}
-	var sysErr *os.SyscallError
-	if stderrors.As(err, &sysErr) {
+	if sysErr, ok := stderrors.AsType[*os.SyscallError](err); ok {
 		if stderrors.Is(sysErr.Err, syscall.ECONNREFUSED) || stderrors.Is(sysErr.Err, syscall.EHOSTUNREACH) {
 			return true
 		}
@@ -415,37 +449,17 @@ func (ue *UdpEndpoint) markRetiredFromReceiver() {
 	go func() { _ = ue.Close() }()
 }
 
-// retireFromReplySender evicts the endpoint from the reply sender. Push mode
-// only marks the endpoint dead: Close() there waits on replyQueueDone, which
-// only this sender closes, so markRetiredFromReceiver hands the actual
-// teardown to a fresh goroutine that waits for this sender to drain. ReadFrom
-// mode has no shared queue, so Close() is safe on this stack and required to
-// release the conn — the read loop's defer only waits on its local senderDone.
-func (ue *UdpEndpoint) retireFromReplySender() {
-	ue.replyQueueMu.Lock()
-	// A failed RegisterPacketReceiver tears the shared queue down
-	// (replyQueueClosed) and then falls back to the ReadFrom loop. The
-	// leftover replyQueueDone must not keep us on the push-mode path:
-	// ReadFrom's sender has to Close() the conn itself.
-	pushMode := ue.replyQueueDone != nil && !ue.replyQueueClosed
-	ue.replyQueueMu.Unlock()
-	if pushMode {
-		ue.markRetiredFromReceiver()
-		return
-	}
-	ue.retire()
-}
-
 // udpEndpointWriteTimeout bounds how long one proxy-side write may block. A
 // UDP datagram normally leaves the socket immediately, but many proxies carry
 // UDP over a TCP transport whose peer can stop ACKing; without a deadline one
 // stalled upstream parks its calling goroutine forever, and under a shared
 // dispatcher a handful of stalled flows would park every worker. Hitting the
 // deadline means the transport stopped draining: handleWriteError retires the
-// endpoint immediately (fail fast). QUIC-backed transports never arm this
-// deadline: their fork-level SetWriteDeadline delegates to SetDeadline, which
-// closes the whole session instead of aborting the write, so a merely-full
-// datagram queue must be absorbed as a dropped datagram instead.
+// endpoint immediately (fail fast). Transports whose SetWriteDeadline is
+// destructive (declared via netproxy.WriteDeadlineBehavior, e.g. the
+// QUIC-session-backed TUIC and Hysteria2 UDP relays, where the deadline is a
+// session-close timer rather than a write abort) never arm this deadline: a
+// merely-full datagram queue must be absorbed as a dropped datagram instead.
 const udpEndpointWriteTimeout = 10 * time.Second
 
 // udpEndpointSendStaleTimeout is how long an established game-like endpoint
@@ -522,14 +536,16 @@ func (ue *UdpEndpoint) sendStaleTimeout() time.Duration {
 }
 
 func (ue *UdpEndpoint) armWriteDeadline(now time.Time) {
-	// QUIC-backed transports (hysteria2/tuic) never arm the deadline. Their
-	// fork-level SetWriteDeadline delegates to SetDeadline, which is a
-	// session-close timer (time.AfterFunc -> conn.Close) rather than a write
-	// abort, so a deadline on a merely-full datagram queue would kill the
-	// whole hy2/tuic session. Connection death there is signalled via
-	// TransportDone and retired by the pool watcher; a full send queue is
-	// congestion and is absorbed as a dropped datagram by handleWriteError.
-	if endpointTransportDoneChannel(ue) != nil {
+	// Transports that declare a session-closing write deadline via the
+	// netproxy.WriteDeadlineBehavior contract (TUIC/Hysteria2: their
+	// SetWriteDeadline delegates to SetDeadline, a session-close timer
+	// rather than a write abort) never arm the deadline. Connection death
+	// there is signalled via TransportDone and retired by the pool watcher;
+	// a full send queue is congestion and is absorbed as a dropped datagram
+	// by handleWriteError. This is deliberately decoupled from
+	// TransportLifecycle: a transport may publish a transport-death signal
+	// while still supporting standard (write-abort) write deadlines.
+	if netproxy.WriteDeadlineClosesSession(ue.conn) {
 		return
 	}
 	last := ue.writeDeadlineArmedAtNano.Load()
@@ -589,10 +605,7 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	if ue.hasReply.Load() {
 		lastSend := ue.lastSendNano.Load()
 		lastReply := ue.lastReplyNano.Load()
-		last := lastSend
-		if lastReply > last {
-			last = lastReply
-		}
+		last := max(lastReply, lastSend)
 		if last != 0 {
 			staleTimeout := ue.sendStaleTimeout()
 			if now.UnixNano()-last >= int64(staleTimeout) {
@@ -648,6 +661,13 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	}
 	ue.hasSent.Store(true)
 	ue.lastSendNano.Store(time.Now().UnixNano())
+	if ue.writeBatch != nil && ue.sentReporter != nil {
+		// A batched endpoint that reached this point sent the datagram
+		// synchronously (the batch rejected it as oversized, see Append), and
+		// its caller skips the inline accounting because the aggregator owns
+		// it. Report it here so the bytes are not silently uncounted.
+		ue.sentReporter(ue, 1, len(b))
+	}
 	return n, nil
 }
 
@@ -681,12 +701,14 @@ func (ue *UdpEndpoint) handleWriteError(err error) error {
 		ue.retire()
 		return err
 	}
-	// Only transports that armed the write deadline (non-QUIC) can hit this:
-	// the deadline is the stall probe, so hitting it is the fail-fast signal.
-	// QUIC-backed transports never arm it — their fork-level SetDeadline
-	// closes the whole session instead of aborting the write — so a merely
-	// full datagram queue (ErrDatagramQueueFullTimeout) falls through to the
-	// tolerated path below instead of tearing down a healthy hy2/tuic session.
+	// Only transports that armed the write deadline (non-destructive
+	// write-deadline semantics) can hit this: the deadline is the stall
+	// probe, so hitting it is the fail-fast signal. Transports that declare
+	// a session-closing deadline via netproxy.WriteDeadlineBehavior (TUIC/
+	// Hysteria2) never arm it — their deadline would close the whole session
+	// instead of aborting the write — so a merely full datagram queue
+	// (ErrDatagramQueueFullTimeout) falls through to the tolerated path
+	// below instead of tearing down a healthy QUIC session.
 	if stderrors.Is(err, os.ErrDeadlineExceeded) {
 		ue.retire()
 		return err
@@ -845,11 +867,9 @@ func (ue *UdpEndpoint) acceptsInitialReplyFrom(from netip.AddrPort) bool {
 	return false
 }
 
-func (ue *UdpEndpoint) setExpiry(deadlineNano int64, refreshCachedResponseConns bool) {
+func (ue *UdpEndpoint) setExpiry(deadlineNano int64) {
 	ue.expiresAtNano.Store(deadlineNano)
-	if refreshCachedResponseConns {
-		ue.refreshCachedResponseConnsWithTime(deadlineNano)
-	}
+	ue.refreshCachedResponseConnsWithTime(deadlineNano)
 }
 
 // RefreshTtlWithTime updates the expiration time using a pre-calculated
@@ -875,7 +895,7 @@ func (ue *UdpEndpoint) RefreshTtlWithTime(nowNano int64) {
 	// CAS to avoid thundering herd on the same connection.
 	if ue.lastRefreshNano.CompareAndSwap(last, nowNano) {
 		deadlineNano := nowNano + int64(timeout)
-		ue.setExpiry(deadlineNano, true)
+		ue.setExpiry(deadlineNano)
 		// Keep cached reply sockets alive as long as the endpoint is alive.
 		// Without this, Anyfrom entries can expire before the owning UDP
 		// endpoint does, forcing a bind syscall on a later reply and causing
@@ -886,15 +906,25 @@ func (ue *UdpEndpoint) RefreshTtlWithTime(nowNano int64) {
 
 // UpdateNatTimeout updates the NAT timeout and refreshes TTL with the new timeout.
 // This allows the timeout to adapt to changing forwarding state (e.g., QUIC upgrade, fixed policy).
+//
+// An unchanged timeout does not take the write lock nor force a deadline bump:
+// the fast paths recompute the same effective value on every packet, and
+// forcing it there cost a write-locked store plus an unconditional expiry store
+// and cached-reply-socket refresh per packet. The renewal is handed back to the
+// existing throttled RefreshTtl instead.
 func (ue *UdpEndpoint) UpdateNatTimeout(timeout time.Duration) {
 	if timeout <= 0 {
+		return
+	}
+	if ue.natTimeout() == timeout {
+		ue.RefreshTtl()
 		return
 	}
 	ue.setNatTimeout(timeout)
 	now := time.Now().UnixNano()
 	// Force immediate refresh on timeout change (bypass throttling).
 	ue.lastRefreshNano.Store(now)
-	ue.setExpiry(now+int64(timeout), true)
+	ue.setExpiry(now + int64(timeout))
 }
 
 func (ue *UdpEndpoint) IsExpired(nowNano int64) bool {

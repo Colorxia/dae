@@ -303,19 +303,14 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 	}
 	defer closeEstablishedTCPFlow(rConn, flow)
 
-	offloaded := false
-	offloadReason := ""
-	annotateOffload := false
-
 	// Attempt kernel-side splice via fast_sock/sk_skb before falling back to
 	// the user-space relay. A registered offload session blocks until both
 	// sockets close; any pre-registration failure falls through silently.
-	var offloadErr error
-	offloaded, offloadReason, offloadErr = c.tryOffloadTCPRelay(flow.Context(), lRelayConn, rConn, RecordDownloadTraffic, RecordUploadTraffic)
+	offloaded, offloadReason, offloadErr := c.tryOffloadTCPRelay(flow.Context(), lRelayConn, rConn, RecordDownloadTraffic, RecordUploadTraffic)
 	if offloadErr != nil {
 		return fmt.Errorf("handleTCP offloaded relay error: %w", offloadErr)
 	}
-	annotateOffload = canResolveTCPRelayOffloadConn(rConn)
+	annotateOffload := canResolveTCPRelayOffloadConn(rConn)
 	if !offloaded && offloadReason != "" && c.log.IsLevelEnabled(logrus.DebugLevel) {
 		logOffloadSkipRateLimited(c.log, offloadReason)
 	}
@@ -443,7 +438,7 @@ func closeWriteRelayConn(conn netproxy.Conn) {
 // a deadline. A nil context is treated as context.Background(). A relayCore
 // orchestrates shared cancellation and force-close fallback.
 func RelayTCPContextWithRecords(ctx context.Context, lConn, rConn netproxy.Conn, leftRecord func(int64), rightRecord func(int64)) (err error) {
-	core := newRelayCore(lConn, rConn, defaultRelayCopyEngine{}, leftRecord, rightRecord)
+	core := newRelayCore(lConn, rConn, leftRecord, rightRecord)
 	return core.run(ctx)
 }
 
@@ -455,6 +450,11 @@ const (
 	// TCPDNSNextReadTimeout is the timeout for reading subsequent queries
 	// on an established DNS-over-TCP connection.
 	TCPDNSNextReadTimeout = 60 * time.Second
+	// TCPDNSWriteTimeout bounds a DNS-over-TCP response write. Without it,
+	// a client that fills the kernel send buffer and then stops reading
+	// while holding the connection open blocks Write forever, pinning the
+	// fastpath goroutine, its fd, and the adopted SessionManager entry.
+	TCPDNSWriteTimeout = 10 * time.Second
 	// TCPDNSMaxMessageSize is the maximum allowed DNS message size (64KB).
 	TCPDNSMaxMessageSize = 65535
 )
@@ -487,6 +487,18 @@ func (w *tcpDnsResponseWriter) RemoteAddr() net.Addr {
 	return w.conn.RemoteAddr()
 }
 
+// write performs one deadline-bounded frame write on the underlying
+// connection and records the traffic on success.
+func (w *tcpDnsResponseWriter) write(buf []byte) (int, error) {
+	_ = w.conn.SetWriteDeadline(time.Now().Add(TCPDNSWriteTimeout))
+	n, err := w.conn.Write(buf)
+	_ = w.conn.SetWriteDeadline(time.Time{})
+	if n > 0 {
+		w.record(int64(n))
+	}
+	return n, err
+}
+
 func (w *tcpDnsResponseWriter) WriteMsg(m *dnsmessage.Msg) error {
 	data, err := m.Pack()
 	if err != nil {
@@ -502,10 +514,7 @@ func (w *tcpDnsResponseWriter) WriteMsg(m *dnsmessage.Msg) error {
 		buf := (*bufPtr)[:totalLen]
 		binary.BigEndian.PutUint16(buf[:2], uint16(len(data)))
 		copy(buf[2:], data)
-		n, err := w.conn.Write(buf)
-		if n > 0 {
-			w.record(int64(n))
-		}
+		_, err = w.write(buf)
 		return err
 	}
 
@@ -513,10 +522,7 @@ func (w *tcpDnsResponseWriter) WriteMsg(m *dnsmessage.Msg) error {
 	buf := make([]byte, totalLen)
 	binary.BigEndian.PutUint16(buf[:2], uint16(len(data)))
 	copy(buf[2:], data)
-	n, err := w.conn.Write(buf)
-	if n > 0 {
-		w.record(int64(n))
-	}
+	_, err = w.write(buf)
 	return err
 }
 
@@ -531,21 +537,19 @@ func (w *tcpDnsResponseWriter) Write(b []byte) (int, error) {
 		buf := (*bufPtr)[:totalLen]
 		binary.BigEndian.PutUint16(buf[:2], uint16(len(b)))
 		copy(buf[2:], b)
-		n, err := w.conn.Write(buf)
-		if n > 0 {
-			w.record(int64(n))
+		if _, err := w.write(buf); err != nil {
+			return 0, err
 		}
-		return len(b), err
+		return len(b), nil
 	}
 
 	buf := make([]byte, totalLen)
 	binary.BigEndian.PutUint16(buf[:2], uint16(len(b)))
 	copy(buf[2:], b)
-	n, err := w.conn.Write(buf)
-	if n > 0 {
-		w.record(int64(n))
+	if _, err := w.write(buf); err != nil {
+		return 0, err
 	}
-	return len(b), err
+	return len(b), nil
 }
 
 func (w *tcpDnsResponseWriter) TsigStatus() error {
@@ -818,11 +822,25 @@ func (c *ControlPlane) handleTCPDnsFastPathOwned(
 
 	// Handle DNS queries in a loop (TCP connections can be persistent)
 	for {
+		var activeController *DnsController
 		err := withActiveDNSController(fallback, flow.Context(), func(queryCtx context.Context, dnsController *DnsController) error {
+			activeController = dnsController
 			return dnsController.HandleWithResponseWriter_(queryCtx, msg, req, writer)
 		})
 		if err != nil {
-			if !stderrors.Is(err, ErrDNSQueryConcurrencyLimitExceeded) {
+			switch {
+			case stderrors.Is(err, ErrDNSQueryConcurrencyLimitExceeded):
+				// REFUSED response has already been written by the controller.
+			case stderrors.Is(err, ErrDNSTruncated) && activeController != nil:
+				// The upstream answer did not fit a single upstream datagram
+				// and no TCP upgrade delivered it. RFC 7766 §5 keeps the query
+				// on TCP and reports TC=1; SERVFAIL would claim the name does
+				// not resolve instead of that the answer did not fit.
+				activeController.noteDnsTruncatedReplyToClient()
+				if writeErr := activeController.sendDnsTruncatedResponse_(msg, req, writer); writeErr != nil {
+					return true, nil
+				}
+			default:
 				// A single failed query must not tear down a persistent DNS/TCP
 				// session. Report SERVFAIL and continue with the next frame.
 				errMsg := new(dnsmessage.Msg)

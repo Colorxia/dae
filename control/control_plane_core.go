@@ -160,6 +160,13 @@ type controlPlaneCore struct {
 	registeredWanPatterns map[string]struct{}
 	tcHookLanPatterns     []string
 	tcHookWanPatterns     []string
+	// bindStateMu guards bindStates (per-link bind outcomes, lazily created).
+	// bindAttempts/bindFailures are the magnitude counters for datapath binds;
+	// see logBindOutcome in control_plane_core_bind_event.go.
+	bindStateMu  sync.Mutex
+	bindStates   map[bindEventKey]*bindEventState
+	bindAttempts atomic.Uint64
+	bindFailures atomic.Uint64
 
 	udpConnStateTracker       atomic.Pointer[udpConnStateTracker]
 	domainRouting             *domainRoutingTracker
@@ -309,17 +316,6 @@ func (c *controlPlaneCore) getUdpConnStateTracker() *udpConnStateTracker {
 	return c.udpConnStateTracker.Load()
 }
 
-func (c *controlPlaneCore) Flip() {
-	// Use CAS loop to avoid race condition between Load and Store.
-	for {
-		old := atomic.LoadInt32(&coreFlip)
-		newVal := old&1 ^ 1
-		if atomic.CompareAndSwapInt32(&coreFlip, old, newVal) {
-			break
-		}
-	}
-}
-
 // addBpfHookDetach adds a BPF hook detachment function to the dedicated list.
 // These functions will be executed immediately on SIGTERM before other cleanup.
 // Uses bpfHookMu to avoid deadlock with c.mu held by callers like _bindLan/_bindWan.
@@ -412,7 +408,12 @@ func (c *controlPlaneCore) resetBpfHookDetachForReattach() {
 	if oldIfmgr != nil {
 		_ = oldIfmgr.Close()
 	}
-	c.addDeferFunc(newIfmgr.Close)
+	// addDeferFunc refuses registration once the core is closed (its
+	// deferFuncs already ran); without this check the fresh ifmgr — a
+	// netlink socket plus its monitor/worker goroutines — would leak.
+	if !c.addDeferFunc(newIfmgr.Close) {
+		_ = newIfmgr.Close()
+	}
 }
 
 // DetachBpfHooks quiesces hook attachment and synchronously detaches every hook
@@ -537,19 +538,19 @@ func (c *controlPlaneCore) EjectBpf() *bpfObjects {
 // buildRoutingKernspaceForSlot builds and records a generation's LPM indices
 // while holding the same core lock used by Close. This keeps map rollback and
 // generation-owned index cleanup from running concurrently.
-func (c *controlPlaneCore) buildRoutingKernspaceForSlot(log *logrus.Logger, snapshot *routingKernspaceSnapshot) ([]uint32, error) {
+func (c *controlPlaneCore) buildRoutingKernspaceForSlot(log *logrus.Logger, snapshot *routingKernspaceSnapshot) error {
 	if c == nil {
-		return nil, fmt.Errorf("nil control plane core")
+		return fmt.Errorf("nil control plane core")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	indices, err := snapshot.BuildKernspaceForSlot(log, c.bpf.Load(), c.RoutingEpochSlot())
 	if err != nil {
-		return nil, err
+		return err
 	}
 	c.lpmTrieIndices = append([]uint32(nil), indices...)
-	return indices, nil
+	return nil
 }
 
 // ReplaceLpmIndices installs a new active LPM index set for this generation.

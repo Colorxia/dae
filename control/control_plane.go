@@ -38,6 +38,7 @@ import (
 	internal "github.com/daeuniverse/dae/pkg/ebpf_internal"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
+	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/direct"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
@@ -68,7 +69,6 @@ type ControlPlane struct {
 	controlPlaneDNSRuntime
 	dnsHandoffMu         sync.Mutex
 	dnsHandoffController atomic.Pointer[DnsController]
-	dnsHandoffOwned      bool
 	onceNetworkReady     sync.Once
 
 	ctx       context.Context
@@ -76,14 +76,29 @@ type ControlPlane struct {
 	ready     chan struct{}
 	readyOnce sync.Once
 
+	// serveLoopErr stores the first terminal ingress loop failure; Serve()
+	// returns it after the context cancellation that fatalIngressLoopError
+	// triggers, so the run loop can fail fast instead of silently
+	// blackholing hijacked traffic.
+	serveLoopErrMu sync.Mutex
+	serveLoopErr   error
+
 	controlPlaneRealDomainRuntime
 	controlPlaneDatapathJanitor
 	bpfMaintenance *bpfMaintenanceBinding
 
-	// Track last alert time to avoid spamming logs
-	lastBpfOverflowAlertTime atomic.Int64
-	lastUdpPressureAlertTime atomic.Int64
-	lastTcpPressureAlertTime atomic.Int64
+	// Datapath counter report state. Unlike a per-alert timestamp, the baselines
+	// it holds are what let a resource alert describe the interval since the
+	// previous line instead of the lifetime total, which never returns to zero
+	// for a map shared across generations. See
+	// control/datapath_overflow_report.go.
+	datapathOverflowReport controlPlaneDatapathOverflowReport
+
+	// Datapath passthrough report state, on the same terms and the same tick:
+	// the two by-design passthrough counters are not part of the report above,
+	// because they are normal rather than resource exhaustion. See
+	// control/datapath_passthrough_report.go.
+	datapathPassthroughReport controlPlaneDatapathPassthroughReport
 
 	wanInterface []string
 	lanInterface []string
@@ -99,6 +114,29 @@ type ControlPlane struct {
 	lastDnsFastPathServfailLogTime atomic.Int64
 	lastHandlePktEpochWarnTime     atomic.Int64
 	tcpConnPanicCount              atomic.Uint64
+	// The janitor map-capacity alerts are paced one per condition, not one per
+	// janitor run: see pacedAlert. They are per-map so that one saturated map
+	// cannot pace another map's alert out of the log.
+	redirectTrackCapacityAlert  pacedAlert
+	cookiePidCapacityAlert      pacedAlert
+	routingHandoffCapacityAlert pacedAlert
+	// Per-packet datapath conditions that hold for every packet of every
+	// affected flow until the underlying state changes. Each has its own pace
+	// so one condition cannot suppress the report of another.
+	udpRoutingTupleWarnAlert    pacedAlert
+	udpDNSRoutingTupleWarnAlert pacedAlert
+	udpHandlePktWarnAlert       pacedAlert
+	// checkBpfMapHealthWarnAlert paces the datapath-counter read failure. The
+	// health check runs on every janitor tick (5s), and a read that fails once
+	// usually fails for as long as the underlying condition lasts, so an
+	// unpaced warn would write one line per 5s with no transition behind it.
+	checkBpfMapHealthWarnAlert pacedAlert
+	// udpDirectDispatchPanicCount and udpIngressLoopPanicCount count recovered
+	// panics on the two UDP packet-path goroutines that have no convoy wrapper:
+	// the direct-dispatch task (DNS/SIP/RTP/STUN exceptions) and the ingress
+	// read loop itself.
+	udpDirectDispatchPanicCount atomic.Uint64
+	udpIngressLoopPanicCount    atomic.Uint64
 	controlPlaneListenerRuntime
 	preparedDatapathCommit         bool
 	autoConfigKernelParameter      bool
@@ -182,6 +220,64 @@ var (
 	resolveIp46ForBootstrap       = netutils.ResolveIp46
 	resolveIp46ForRealDomainProbe = netutils.ResolveIp46
 )
+
+// containerMountHint explains the container case without making it the only
+// hypothesis: an LXC container whose host does not expose bpffs cannot fix this
+// from inside.
+const containerMountHint = " (inside a container the host must expose a bpffs mount; if it cannot, use higher virtualization such as kvm/qemu)"
+
+// ensureBpfPinDir creates the BPF pin directory and, when that fails, reports
+// the actual state of the pin root instead of a fixed hypothesis. The previous
+// message blamed containers for every mkdir failure, which sent users after the
+// wrong cause: dae has already created its datapath devices by this point, a
+// container with a proper bpffs mount works fine, and the raw mkdir text never
+// told anyone what to do.
+func ensureBpfPinDir(pinPath string, log *logrus.Logger) error {
+	err := os.MkdirAll(pinPath, 0o755)
+	if err == nil || os.IsExist(err) {
+		return nil
+	}
+	wrapped := bpfPinDirError(pinPath, err, isBpfPinRootMounted())
+	if log != nil {
+		log.Warnln(wrapped)
+	}
+	return wrapped
+}
+
+// bpfPinDirError builds the message from the observed state of the pin root.
+// Only a missing mount makes the mount advice actionable; a permission or
+// not-a-directory failure keeps its raw cause and gains no container hint, so
+// the message never points at the wrong problem.
+func bpfPinDirError(pinPath string, mkdirErr error, pinRootMounted bool) error {
+	if !pinRootMounted {
+		return fmt.Errorf("bpf pin root %s is not a bpffs mount, so %s cannot be created: %w; mount it with \"mount -t bpf bpffs %s\"%s",
+			consts.BpfPinRoot, pinPath, mkdirErr, consts.BpfPinRoot, containerMountHint)
+	}
+	return fmt.Errorf("cannot create bpf pin directory %s: %w", pinPath, mkdirErr)
+}
+
+// bpfPinRootMountedFrom reports whether /proc/mounts content contains a bpffs
+// mount at root. It is split out so the parser can be tested against fixtures
+// instead of trusting the host's own mount table.
+func bpfPinRootMountedFrom(mounts string) bool {
+	for line := range strings.Lines(mounts) {
+		fields := strings.Fields(line)
+		if len(fields) >= 3 && fields[1] == consts.BpfPinRoot && fields[2] == "bpf" {
+			return true
+		}
+	}
+	return false
+}
+
+// isBpfPinRootMounted reports whether bpffs is mounted at the pin root, read
+// from /proc/mounts so the diagnosis matches the running kernel.
+func isBpfPinRootMounted() bool {
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return false
+	}
+	return bpfPinRootMountedFrom(string(data))
+}
 
 func isIPLikeDomain(domain string) bool {
 	if domain == "" {
@@ -336,10 +432,7 @@ func NewControlPlaneWithContextOptions(
 		pinPath = filepath.Join(pinPath, fmt.Sprintf("reload-%d-%d", os.Getpid(), time.Now().UnixNano()))
 		ephemeralPinPath = true
 	}
-	if err = os.MkdirAll(pinPath, 0755); err != nil && !os.IsExist(err) {
-		if os.IsNotExist(err) {
-			log.Warnln("Perhaps you are in a container environment (such as lxc). If so, please use higher virtualization (kvm/qemu).")
-		}
+	if err = ensureBpfPinDir(pinPath, log); err != nil {
 		return nil, err
 	}
 	if ephemeralPinPath {
@@ -416,6 +509,14 @@ func NewControlPlaneWithContextOptions(
 	// Ensure critical maps are always present. DNS fast-path optimizations only
 	// skip per-flow map updates, never map object creation.
 	if err = validateRequiredBpfMapsLoaded(bpf); err != nil {
+		// On a fresh load the objects are solely owned here: no core, no
+		// deferFuncs, and LoadAndAssign already moved every object out of
+		// the loader. Close them explicitly or the whole set leaks until
+		// process exit (shared reloads keep ownership elsewhere and must
+		// not close here).
+		if !sharedBpfReload {
+			_ = bpf.Close()
+		}
 		return nil, fmt.Errorf("validate bpf maps: %w", err)
 	}
 	log.Infof("Loaded eBPF programs and maps")
@@ -476,6 +577,35 @@ func NewControlPlaneWithContextOptions(
 	locationFinder := assets.NewLocationFinder(externGeoDataDirs)
 	option := dialer.NewGlobalOption(global, log)
 	option.SetRuntimeDependencies(directDialer, fullconeDirectDialer, systemDNSResolver)
+
+	// A proxy transport may have to resolve a peer-supplied domain-typed address
+	// on its datagram read path. Point that lookup at this generation's DNS view
+	// -- the system resolver with its configured fallback -- instead of the bare
+	// process resolver: inside a netns, or on a host whose /etc/resolv.conf is
+	// empty or points back at dae itself, the process resolver hangs or fails.
+	// The answer becomes the source address of a datagram sent to a client, so
+	// it must be a real record: no routing rewrite, no synthetic address.
+	protocol.SetDatapathResolver(func(ctx context.Context, host string) (netip.Addr, error) {
+		dns, err := systemDNSResolver.SystemDNS()
+		if err != nil {
+			return netip.Addr{}, err
+		}
+		ips, err4, err6 := netutils.ResolveIp46(ctx, directDialer, dns, host, "udp", true)
+		if ips.Ip4.IsValid() {
+			return ips.Ip4, nil
+		}
+		if ips.Ip6.IsValid() {
+			return ips.Ip6, nil
+		}
+		if err4 != nil {
+			return netip.Addr{}, err4
+		}
+		if err6 != nil {
+			return netip.Addr{}, err6
+		}
+		return netip.Addr{}, fmt.Errorf("no address for %q", host)
+	})
+
 	option.DaeDNS, err = daedns.NewWithOption(log, global, dnsConfig, &daedns.NewOption{
 		LocationFinder: locationFinder,
 		DirectDialer:   directDialer,
@@ -648,7 +778,7 @@ func NewControlPlaneWithContextOptions(
 	kernspaceSnapshot := builder.KernspaceSnapshot()
 	if !buildOpts.DelayDatapathCommit {
 		log.Infoln("Loading routing rules into kernel space (BPF)...")
-		if _, err = core.buildRoutingKernspaceForSlot(log, kernspaceSnapshot); err != nil {
+		if err = core.buildRoutingKernspaceForSlot(log, kernspaceSnapshot); err != nil {
 			return nil, fmt.Errorf("routing kernspace snapshot: %w", err)
 		}
 		if err = core.StageRoutingEpoch(); err != nil {
@@ -785,6 +915,7 @@ func NewControlPlaneWithContextOptions(
 	plane.dnsFixedDomainTtl = fixedDomainTtl
 	plane.dnsOptimisticCache = dnsConfig.OptimisticCache
 	plane.dnsOptimisticCacheTtl = dnsConfig.OptimisticCacheTtl
+	plane.dnsOptimisticStaleReplyTtl = dnsConfig.OptimisticStaleReplyTtl
 	plane.dnsMaxCacheSize = dnsConfig.MaxCacheSize
 	plane.dnsIpVersionPrefer = dnsConfig.IpVersionPrefer
 	plane.dnsController, err = NewDnsController(dnsUpstream, plane.dnsControllerOption())
@@ -900,7 +1031,6 @@ func validateRequiredBpfMapsLoaded(bpf *bpfObjects) error {
 		{name: "routing_map", m: bpf.RoutingMap},
 		{name: "routing_meta_map", m: bpf.RoutingMetaMap},
 		{name: "active_routing_epoch_map", m: bpf.ActiveRoutingEpochMap},
-		{name: "routing_epoch_map", m: bpf.RoutingEpochMap},
 	}
 	for _, r := range required {
 		if r.m == nil {
@@ -964,15 +1094,12 @@ func (c *ControlPlane) acquireDrainTicket() func() {
 }
 
 // InheritDialerHealthFrom copies health snapshots from a previous control plane
-// generation into the current one. It returns true when at least one dialer
-// matched by group+name between the old and new generation, indicating that
-// active connections on those dialers may survive the reload.
-func (c *ControlPlane) InheritDialerHealthFrom(previous *ControlPlane) bool {
+// generation into the current one, so a reload does not reset health for
+// dialers that both generations share.
+func (c *ControlPlane) InheritDialerHealthFrom(previous *ControlPlane) {
 	if c == nil || previous == nil {
-		return false
+		return
 	}
-
-	var hasOverlap bool
 
 	previousGroups := make(map[string]*outbound.DialerGroup, len(previous.outbounds))
 	for _, group := range previous.outbounds {
@@ -1003,7 +1130,6 @@ func (c *ControlPlane) InheritDialerHealthFrom(previous *ControlPlane) bool {
 				continue
 			}
 			if oldDialer := oldDialers[d.Property().Name]; oldDialer != nil {
-				hasOverlap = true
 				if dialerHealthCheckConfigEqual(d, oldDialer) {
 					d.RestoreHealthSnapshot(oldDialer.ReloadHealthSnapshot())
 				}
@@ -1011,7 +1137,6 @@ func (c *ControlPlane) InheritDialerHealthFrom(previous *ControlPlane) bool {
 		}
 		group.EnsureReloadSelectionFloor(fallback)
 	}
-	return hasOverlap
 }
 
 func dialerHealthCheckConfigEqual(current, previous *dialer.Dialer) bool {
@@ -1162,11 +1287,12 @@ func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 				UdpHealthDomain: dialer.UdpHealthDomainDns,
 			}, err)
 		},
-		FixedDomainTtl:     c.dnsFixedDomainTtl,
-		OptimisticCache:    c.dnsOptimisticCache,
-		OptimisticCacheTtl: c.dnsOptimisticCacheTtl,
-		MaxCacheSize:       c.dnsMaxCacheSize,
-		IpVersionPrefer:    c.dnsIpVersionPrefer,
+		FixedDomainTtl:          c.dnsFixedDomainTtl,
+		OptimisticCache:         c.dnsOptimisticCache,
+		OptimisticCacheTtl:      c.dnsOptimisticCacheTtl,
+		OptimisticStaleReplyTtl: c.dnsOptimisticStaleReplyTtl,
+		MaxCacheSize:            c.dnsMaxCacheSize,
+		IpVersionPrefer:         c.dnsIpVersionPrefer,
 	}
 }
 
@@ -1527,14 +1653,21 @@ func (c *ControlPlane) runReloadRetirementCleanup(staleBeforeNs uint64) {
 
 // redirectTrackTimeout is the TTL for redirect entries.
 // Redirect entries track which interface and MAC addresses to use for reply traffic.
-// A longer timeout is acceptable because these entries are small and the consequence
-// of stale entries is minimal (wrong MAC address causes one packet to be misdirected).
+// The TTL only governs entries with no live owner: cleanupRedirectTrackMap
+// consults the pin snapshot BEFORE the age test, so a process-owned
+// connection's entry is never retired by age while its flow lives - the pin,
+// not the TTL, is what keeps an active connection's MAC mapping in place. For
+// the unpinned remainder a longer TTL is acceptable because these entries are
+// small and the consequence of a stale one is bounded: it is refreshed by the
+// next reply packet, and until then it can only misdirect that one reply.
 const redirectTrackTimeout = 5 * time.Minute
 
 // cleanupRedirectTrackMap iterates through the redirect track map and removes
-// entries that haven't been accessed within redirectTrackTimeout.
-// This is necessary because redirect_track uses HASH (not LRU) to avoid
-// the problem where long-lived connections prevent cleanup of other entries.
+// entries that haven't been accessed within redirectTrackTimeout. Pinned
+// entries are skipped before the age test, so a pinned long-lived connection
+// keeps its own entry for as long as its flow lives without ever blocking the
+// cleanup of any other entry: redirect_track is a HASH map, so there is no LRU
+// eviction order for it to occupy.
 func (c *ControlPlane) cleanupRedirectTrackMap() int {
 	cleanupMu, _ := c.maintenanceState()
 	cleanupMu.Lock()
@@ -1620,13 +1753,15 @@ func (c *ControlPlane) cleanupRedirectTrackMapBeforeLocked(staleBeforeNs uint64)
 		c.log.Debugf("cleanupRedirectTrackMap: removed %d entries", len(keysToDelete))
 	}
 
-	// Alert if map usage is high
-	const redirectTrackCapacity = 65536
-	if totalEntries > 0 {
+	// Alert if map usage is high. The capacity is read from the loaded map
+	// instead of a second hard-coded copy of MAX_REDIRECT_TRACK_NUM: the map
+	// capacity is owned by tuneRedirectTrackMap, which cross-checks the
+	// compiled value against the Go constant at load time.
+	redirectTrackCapacity := bpf.RedirectTrack.MaxEntries()
+	if totalEntries > 0 && redirectTrackCapacity > 0 {
 		usagePercent := float64(totalEntries) / float64(redirectTrackCapacity) * 100
 		if usagePercent > 90 {
-			c.log.Warnf("cleanupRedirectTrackMap: map at %.1f%% capacity (%d entries)",
-				usagePercent, totalEntries)
+			c.logMapCapacityAlert(&c.redirectTrackCapacityAlert, "cleanupRedirectTrackMap", usagePercent, totalEntries)
 		}
 	}
 	return len(keysToDelete)
@@ -1704,7 +1839,7 @@ func (c *ControlPlane) cleanupCookiePidMapBeforeLocked(staleBeforeNs uint64) int
 	if totalEntries > 0 && maxEntries > 0 {
 		usagePercent := float64(totalEntries) / float64(maxEntries) * 100
 		if usagePercent > 90 {
-			c.log.Warnf("cleanupCookiePidMap: map at %.1f%% capacity (%d entries)", usagePercent, totalEntries)
+			c.logMapCapacityAlert(&c.cookiePidCapacityAlert, "cleanupCookiePidMap", usagePercent, totalEntries)
 		}
 	}
 	return len(keysToDelete)
@@ -1780,10 +1915,35 @@ func (c *ControlPlane) cleanupRoutingHandoffMapBeforeLocked(staleBeforeNs uint64
 	if totalEntries > 0 && maxEntries > 0 {
 		usagePercent := float64(totalEntries) / float64(maxEntries) * 100
 		if usagePercent > 90 {
-			c.log.Warnf("cleanupRoutingHandoffMap: map at %.1f%% capacity (%d entries)", usagePercent, totalEntries)
+			c.logMapCapacityAlert(&c.routingHandoffCapacityAlert, "cleanupRoutingHandoffMap", usagePercent, totalEntries)
 		}
 	}
 	return len(keysToDelete)
+}
+
+// datapathCounterReadFailureCooldown paces the datapath-counter read failure.
+// The health check runs on every janitor tick (5s), so an unpaced report of a
+// read that keeps failing writes ~720 lines/hour at the default log level. The
+// condition is worth reporting (a failed read hides every datapath counter),
+// so it is paced rather than demoted, and each emitted line carries the number
+// of failed reads it folded in.
+const datapathCounterReadFailureCooldown = 30 * time.Second
+
+// logDatapathCounterReadFailure reports a failed datapath-counter snapshot
+// read at most once per cooldown. The count in the line is the number of failed
+// reads since the process started, so a condition that never clears stays
+// visible as a magnitude instead of one line per tick, and the first failure is
+// always reported (a single failure is never suppressed).
+func (c *ControlPlane) logDatapathCounterReadFailure(now time.Time, err error) {
+	if c == nil || c.log == nil || err == nil {
+		return
+	}
+	failures, emit := c.checkBpfMapHealthWarnAlert.observe(now, datapathCounterReadFailureCooldown)
+	if !emit {
+		return
+	}
+	c.log.Warnf("checkBpfMapHealth: %v (failures=%d, reporting at most one line per %v)",
+		err, failures, datapathCounterReadFailureCooldown)
 }
 
 // checkBpfMapHealth monitors map usage and overflow counters for robustness.
@@ -1795,76 +1955,96 @@ func (c *ControlPlane) checkBpfMapHealth(udpOverflow, tcpOverflow uint64) {
 		return
 	}
 
-	// Define alert thresholds
-	const (
-		warnThreshold = 70               // Alert at 70% capacity
-		critThreshold = 85               // Critical alert at 85% capacity
-		alertCooldown = 30 * time.Second // Minimum time between alerts
+	// Read the counters added for the datapath visibility work (redirect
+	// track, rebind rejections, stateless passthrough, ...). The two
+	// conn-state overflow counters are passed in by the janitor because they
+	// also drive its pressure mode. A read failure would silently hide every
+	// counter, so it is reported instead of ignored.
+	var (
+		snap        bpfStatsSnapshot
+		snapshotErr error
 	)
+	if bpf.BpfStatsMap != nil {
+		snap, snapshotErr = c.readDatapathCounters(bpf.BpfStatsMap)
+	}
 
 	now := time.Now()
 
-	// Alert on significant overflow counts
-	if udpOverflow > 0 || tcpOverflow > 0 {
-		// Use atomic Int64 to store the last alert time in Unix nanoseconds.
-		// Cooldown prevents alert spam.
-		nowNano := now.UnixNano()
-		last := c.lastBpfOverflowAlertTime.Load()
-		if last == 0 || last+int64(alertCooldown) < nowNano {
-			if c.lastBpfOverflowAlertTime.CompareAndSwap(last, nowNano) {
-				c.log.Warnf("BPF map overflow detected: UDP conn state=%d, TCP conn state=%d. "+
-					"Some packets are falling back to slower paths. Check if map capacity is adequate.",
-					udpOverflow, tcpOverflow)
-			}
-		}
+	if snapshotErr != nil {
+		c.logDatapathCounterReadFailure(now, snapshotErr)
 	}
 
-	// Estimate map usage by sampling (full iteration is expensive)
-	if bpf.ConnStateMap == nil {
-		return
+	// The by-design passthrough counters are published from this same snapshot
+	// on the same tick; see control/datapath_passthrough_report.go.
+	c.reportDatapathPassthroughSummary(now, snap)
+
+	// The conn-state capacity is the operator's lever on an overflowing
+	// conn-state map, so it is carried into the report rather than read by it.
+	connStateCapacity := uint64(0)
+	if bpf.ConnStateMap != nil {
+		connStateCapacity = uint64(bpf.ConnStateMap.MaxEntries())
 	}
 
-	maxEntries := bpf.ConnStateMap.MaxEntries()
-	if maxEntries == 0 {
-		return
-	}
-
-	// If overflow is happening, map is under pressure.
-	if udpOverflow > 100 {
-		nowNano := now.UnixNano()
-		last := c.lastUdpPressureAlertTime.Load()
-		if last == 0 || last+int64(alertCooldown) < nowNano {
-			if c.lastUdpPressureAlertTime.CompareAndSwap(last, nowNano) {
-				c.log.Errorf("CRITICAL: UDP conn state map is under heavy pressure (overflow=%d). "+
-					"Configured capacity=%d. Consider increasing conn_state_map capacity or reducing UDP connection timeout.",
-					udpOverflow, maxEntries)
-			}
-		}
-	}
-	if tcpOverflow > 100 {
-		nowNano := now.UnixNano()
-		last := c.lastTcpPressureAlertTime.Load()
-		if last == 0 || last+int64(alertCooldown) < nowNano {
-			if c.lastTcpPressureAlertTime.CompareAndSwap(last, nowNano) {
-				c.log.Errorf("CRITICAL: TCP conn state map is under heavy pressure (overflow=%d). "+
-					"Configured capacity=%d. Consider increasing conn_state_map capacity or reducing TCP connection timeout.",
-					tcpOverflow, maxEntries)
-			}
-		}
-	}
+	// Publish the counters for the interval since the previous line. Comparing
+	// them against their lifetime totals instead (the previous behaviour) meant
+	// that a single overflow ever observed re-alerted on every cooldown expiry
+	// for the life of the process, because these counters never return to zero,
+	// and that "CRITICAL ... overflow=%d" presented a lifetime total as if it
+	// were pressure happening now.
+	c.reportDatapathOverflowInterval(now, snap, udpOverflow, tcpOverflow, connStateCapacity)
 }
 
+// readMapOverflowCounters reads the two conn-state overflow counters that
+// drive the janitor's pressure mode. The remaining bpf_stats_map keys are read
+// by readDatapathCounters on the health-check cadence.
 func (c *ControlPlane) readMapOverflowCounters(m *ebpf.Map) (udpOverflow uint64, tcpOverflow uint64) {
 	if m == nil {
 		return 0, 0
 	}
-	if v, err := readBpfStatsCounter(m, 0); err == nil {
+	if v, err := readBpfStatsCounter(m, bpfStatsUDPConnOverflow); err == nil {
 		udpOverflow = v
 	}
-	if v, err := readBpfStatsCounter(m, 1); err == nil {
+	if v, err := readBpfStatsCounter(m, bpfStatsTCPConnOverflow); err == nil {
 		tcpOverflow = v
 	}
 	return udpOverflow, tcpOverflow
+}
+
+// readDatapathCounters reads the bpf_stats_map counters added for the
+// datapath-visibility work (P2-8/P2-29/P2-30/P2-31/P3-14/P3-16/P3-18 and the
+// routing-epoch rebind reroute). Every key is read or the whole read fails: a
+// partially reported snapshot would look like "no anomaly" for the missing
+// keys.
+func (c *ControlPlane) readDatapathCounters(m *ebpf.Map) (bpfStatsSnapshot, error) {
+	var snap bpfStatsSnapshot
+
+	if m == nil {
+		return snap, fmt.Errorf("read datapath counters: bpf_stats_map is not loaded")
+	}
+	for _, field := range []struct {
+		name string
+		key  uint32
+		dst  *uint64
+	}{
+		{"redirect overflow", bpfStatsRedirectOverflow, &snap.RedirectOverflow},
+		{"redirect update failed", bpfStatsRedirectUpdateFailed, &snap.RedirectUpdateFailed},
+		{"redirect rebind rejected", bpfStatsRedirectRebindRejected, &snap.RedirectRebindRejected},
+		{"syn rebind rejected", bpfStatsSynRebindRejected, &snap.SynRebindRejected},
+		{"stateless tcp passthrough", bpfStatsStatelessTCPPassthrough, &snap.StatelessTCPPassthrough},
+		{"frag tail passed", bpfStatsFragTailPassed, &snap.FragTailPassed},
+		{"parse unsupported l4", bpfStatsParseUnsupportedL4, &snap.ParseUnsupportedL4},
+		{"unsolicited udp seen", bpfStatsUnsolicitedUDPSeen, &snap.UnsolicitedUDPSeen},
+		{"sockmark fallback", bpfStatsSockmarkFallback, &snap.SockmarkFallback},
+		{"event drop", bpfStatsEventDrop, &snap.EventDrop},
+		{"rebind rerouted after epoch change", bpfStatsRebindReroutedAfterEpochChange, &snap.RebindReroutedAfterEpochChange},
+	} {
+		v, err := readBpfStatsCounter(m, field.key)
+		if err != nil {
+			return snap, fmt.Errorf("read bpf_stats_map counter %q (key %d): %w", field.name, field.key, err)
+		}
+		*field.dst = v
+	}
+	return snap, nil
 }
 
 func (c *ControlPlane) allowDnsFastPathErrorLog(now time.Time) bool {
@@ -2083,38 +2263,44 @@ func (l *Listener) Close() error {
 // Clone duplicates the listener sockets so a new control plane generation can
 // take over serving before the old generation closes its copies. This allows
 // reload to wake the old Accept/Read goroutines without rebinding the port.
-func (l *Listener) Clone() (cloned *Listener, err error) {
+func (l *Listener) Clone() (*Listener, error) {
 	if l == nil {
 		return nil, fmt.Errorf("nil listener")
 	}
 
-	cloned = &Listener{port: l.port}
+	// Keep the partial clone in a plain local: the error returns below must
+	// not overwrite the named result before the deferred cleanup inspects it.
+	var err error
+	partial := &Listener{port: l.port}
 	defer func() {
-		if err != nil && cloned != nil {
-			_ = cloned.Close()
+		if err != nil {
+			// Best-effort close of every socket duplicated before the failure
+			// so a failed staged reload releases ports/fds deterministically
+			// instead of leaving them to the garbage collector.
+			_ = partial.Close()
 		}
 	}()
 
 	if l.tcp4Listener != nil {
-		cloned.tcp4Listener, err = cloneTCPListener(l.tcp4Listener)
+		partial.tcp4Listener, err = cloneTCPListener(l.tcp4Listener)
 		if err != nil {
 			return nil, fmt.Errorf("clone tcp4 listener: %w", err)
 		}
 	}
 	if l.tcp6Listener != nil {
-		cloned.tcp6Listener, err = cloneTCPListener(l.tcp6Listener)
+		partial.tcp6Listener, err = cloneTCPListener(l.tcp6Listener)
 		if err != nil {
 			return nil, fmt.Errorf("clone tcp6 listener: %w", err)
 		}
 	}
 	if l.packetConn != nil {
-		cloned.packetConn, err = cloneUDPPacketConn(l.packetConn)
+		partial.packetConn, err = cloneUDPPacketConn(l.packetConn)
 		if err != nil {
 			return nil, fmt.Errorf("clone udp packet conn: %w", err)
 		}
 	}
 
-	return cloned, nil
+	return partial, nil
 }
 
 func cloneTCPListener(listener net.Listener) (net.Listener, error) {
@@ -2228,6 +2414,66 @@ func shouldSkipDNSFastPathForLocalListenerTraffic(listenAddr string, src, dst ne
 	return false
 }
 
+// ingressRetryBackoff is the pause between retries of transient ingress
+// loop errors (fd/memory pressure) so resource exhaustion can clear without
+// tearing the listener loop down.
+const ingressRetryBackoff = 100 * time.Millisecond
+
+// ingressResourceExhausted reports whether an ingress loop error is transient
+// resource exhaustion worth retrying instead of exiting the loop. Exiting the
+// accept/read loop on EMFILE/ENFILE/ENOMEM/ENOBUFS would silently blackhole
+// the listener for that address family until the next reload.
+func ingressResourceExhausted(err error) bool {
+	return stderrors.Is(err, syscall.EMFILE) ||
+		stderrors.Is(err, syscall.ENFILE) ||
+		stderrors.Is(err, syscall.ENOMEM) ||
+		stderrors.Is(err, syscall.ENOBUFS)
+}
+
+// ingressWakeTimeout reports whether err is the read-deadline expiry that
+// Listener.Close installs through wakePacketConn to unblock a parked UDP
+// ingress read. A timeout therefore means the listener is being closed, which
+// is a clean stop; treating it as fatal let a reload's listener handoff abort
+// the retiring generation with "ingress loop terminated". The TCP accept loop
+// below already returns cleanly on the same signal.
+func ingressWakeTimeout(err error) bool {
+	netErr, ok := stderrors.AsType[net.Error](err)
+	return ok && netErr.Timeout()
+}
+
+// retryIngressAfterBackoff logs (rate-limited) and sleeps briefly so the
+// caller can retry a transient ingress error. It reports whether the caller
+// should keep looping; false means the plane is shutting down.
+func (c *ControlPlane) retryIngressAfterBackoff(op string, err error) bool {
+	if c.allowConnectionErrorLog(time.Now()) {
+		c.log.Errorf("%s: transient error, retrying: %v", op, err)
+	}
+	select {
+	case <-c.ctx.Done():
+		return false
+	case <-time.After(ingressRetryBackoff):
+		return true
+	}
+}
+
+// fatalIngressLoopError records a terminal ingress loop failure and cancels
+// the plane context so Serve() stops blocking on ctx.Done and returns the
+// error to its caller. Without this, a detached accept/read loop that dies
+// on an unclassified error (EPERM, EINVAL, ...) leaves Serve() returning nil
+// and the hijacked traffic silently blackholes until the next reload.
+func (c *ControlPlane) fatalIngressLoopError(op string, err error) {
+	wrapped := fmt.Errorf("%s: %w", op, err)
+	c.serveLoopErrMu.Lock()
+	if c.serveLoopErr == nil {
+		c.serveLoopErr = wrapped
+	}
+	c.serveLoopErrMu.Unlock()
+	if c.cancel != nil {
+		c.cancel()
+	}
+	c.log.Errorf("[Critical] Ingress loop terminated: %v", wrapped)
+}
+
 func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err error) {
 	sentReady := false
 	defer func() {
@@ -2292,13 +2538,24 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			}
 			lconn, err := tcpListener.Accept()
 			if err != nil {
-				var netErr net.Error
-				if stderrors.As(err, &netErr) && netErr.Timeout() {
+				if netErr, ok := stderrors.AsType[net.Error](err); ok && netErr.Timeout() {
 					return
 				}
-				if !commonerrors.IsClosedConnection(err) && !stderrors.Is(err, context.Canceled) {
-					c.log.Errorf("Error when accept: %v", err)
+				if commonerrors.IsClosedConnection(err) || stderrors.Is(err, context.Canceled) {
+					return
 				}
+				if ingressResourceExhausted(err) {
+					// Transient fd/memory pressure: retry with a short
+					// backoff instead of tearing the accept loop down.
+					// Exiting here would silently blackhole this address
+					// family until the next reload.
+					if !c.retryIngressAfterBackoff("Accept", err) {
+						return
+					}
+					continue
+				}
+				c.log.Errorf("Error when accept: %v", err)
+				c.fatalIngressLoopError("accept", err)
 				return
 			}
 			go func(lconn net.Conn) {
@@ -2328,6 +2585,19 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 	go serveTCP(listener.tcp4Listener)
 	go serveTCP(listener.tcp6Listener)
 	go func() {
+		// Panic isolation for the ingress read loop: this goroutine runs
+		// processPacket synchronously (ClassifyUdpFlow, admission, pooled task
+		// checkout, batch read), so an unrecovered panic here would take down
+		// the whole process. Recovery is not a silent drop: the plane context
+		// is cancelled so Serve() returns the first error and the run loop can
+		// fail fast. This defer is registered first, so it runs after the
+		// batch reader's own Close defer during the unwind.
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				reportPacketPathPanic("udp_ingress", "read_loop", &c.udpIngressLoopPanicCount, recovered)
+				c.fatalIngressLoopError("udp-ingress-read-loop-panic", fmt.Errorf("recovered panic: %v", recovered))
+			}
+		}()
 		processPacket := func(pktBuf pool.PB, src netip.AddrPort, oob []byte) {
 			pktDst := RetrieveOriginalDest(oob)
 			realDst := common.ConvergeAddrPort(pktDst)
@@ -2379,7 +2649,12 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				select {
 				case c.udpDirectDispatchSem <- struct{}{}:
 					task.dispatchSem = c.udpDirectDispatchSem
-					go task.Run()
+					// Panic isolation: task.Run() releases the dispatch
+					// slot, the admission ticket, the packet buffer, and
+					// the pooled task through its own defers, which all
+					// complete during the unwind. The wrapper must only
+					// report the panic (see runDirectDispatchTask).
+					go runDirectDispatchTask(task, &c.udpDirectDispatchPanicCount)
 				default:
 					task.Discard()
 				}
@@ -2415,8 +2690,12 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				// preserving one exclusive ingress buffer per packet.
 				n, err := batchReader.ReadBatch()
 				if err != nil {
-					if !commonerrors.IsClosedConnection(err) {
+					if !commonerrors.IsClosedConnection(err) && !ingressWakeTimeout(err) {
+						if ingressResourceExhausted(err) && c.retryIngressAfterBackoff("ReadBatchUDP", err) {
+							continue
+						}
 						c.log.Errorf("ReadBatchUDP: %v", err)
+						c.fatalIngressLoopError("read-batch-udp", err)
 					}
 					break
 				}
@@ -2433,6 +2712,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 
 	singleRead:
 		var oob [udpIngressOobSize]byte
+		singleReader := udpIngressSingleReader{pc: udpConn}
 		for {
 			select {
 			case <-c.ctx.Done():
@@ -2440,20 +2720,25 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			default:
 			}
 
-			pktBuf := pool.GetFullCap(consts.EthernetMtu)
-			n, oobn, _, src, err := udpConn.ReadMsgUDPAddrPort(pktBuf, oob[:])
+			pktBuf, src, oobn, err := singleReader.Read(oob[:])
 			if err != nil {
-				pktBuf.Put()
-				if !commonerrors.IsClosedConnection(err) {
+				if !commonerrors.IsClosedConnection(err) && !ingressWakeTimeout(err) {
+					if ingressResourceExhausted(err) && c.retryIngressAfterBackoff("ReadMsgUDPAddrPort", err) {
+						continue
+					}
 					c.log.Errorf("ReadMsgUDPAddrPort: %v", err)
+					c.fatalIngressLoopError("read-udp", err)
 				}
 				break
+			}
+			if pktBuf == nil {
+				continue
 			}
 
 			// Dual-stack UDP listener path: prefer correctness and IPv6 coverage
 			// over batch-read optimization. OOB is consumed synchronously in
 			// processPacket, so reusing the stack buffer is safe here.
-			processPacket(pktBuf[:n], src, oob[:oobn])
+			processPacket(pktBuf, src, oob[:oobn])
 		}
 	}()
 	c.ActivateCheck()
@@ -2467,7 +2752,12 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			"error": ctxErr.Error(),
 		}).Info("[ControlPlane] Serve() exiting; context cancelled")
 	}
-	return nil
+	// A terminal ingress loop failure cancels the context and stashes its
+	// error here; surface it so the caller can fail fast.
+	c.serveLoopErrMu.Lock()
+	serveErr := c.serveLoopErr
+	c.serveLoopErrMu.Unlock()
+	return serveErr
 }
 
 // Listen opens the ingress listeners without starting the serving loops.
@@ -2527,6 +2817,11 @@ func (c *ControlPlane) ListenAndServe(readyChan chan<- bool, port uint16) (liste
 	}
 
 	if err = c.Serve(readyChan, listener); err != nil {
+		// This wrapper created the sockets, so it owns them: close on failure
+		// so a retried startup cannot leave the previous attempt's listeners
+		// bound until GC. The caller receives nil on error, matching the
+		// historical contract.
+		_ = listener.Close()
 		return nil, fmt.Errorf("failed to serve: %w", err)
 	}
 
@@ -2665,37 +2960,18 @@ func (c *ControlPlane) abortConnections(abortManagedTCP bool) (err error) {
 	}
 	connections, flows, errs := c.takeIncomingConnectionsForAbort()
 	if abortManagedTCP {
+		// Explicit abort: the operator asked for established connections to
+		// be closed ("reload --abort"). Migration of surviving TCP flows to
+		// the linked peer generation is a seamless-reload optimization and
+		// must not apply on this path; matching flows would otherwise outlive
+		// the explicit abort, retaining their previous routing decision
+		// (seamless flow continuity on ordinary reloads is provided by the
+		// per-packet epoch migration in the datapath/egress runtime, not by
+		// this teardown). Abort every generation-owned flow instead.
 		manager, _ := c.controlPlaneSessionManager()
 		if manager != nil {
-			// Attempt to migrate surviving TCP flows to the peer
-			// generation before falling back to abort. This keeps
-			// established connections alive across a same-port reload
-			// when the new generation shares a dialer with the old one.
-			c.routingEpochPeerMu.RLock()
-			peer := c.routingEpochPeer
-			c.routingEpochPeerMu.RUnlock()
-			if peer != nil {
-				newBpf := peer.PeekBpf()
-				newEpoch := peer.PolicyEpoch()
-				migrated, remaining := manager.MigrateGeneration(
-					c.PolicyEpoch(), newEpoch, newBpf, peer.egressRuntime,
-				)
-				if migrated > 0 && c.log != nil {
-					c.log.Infof("[Reload] Migrated %d TCP flows to new generation; %d remaining",
-						migrated, remaining)
-				}
-				// Only abort the flows that could not be migrated.
-				if remaining > 0 {
-					if abortErr := manager.AbortGeneration(c.PolicyEpoch()); abortErr != nil {
-						errs = append(errs, abortErr)
-					}
-				}
-			} else {
-				// No peer generation (e.g. fresh start or shutdown):
-				// abort all flows immediately.
-				if abortErr := manager.AbortGeneration(c.PolicyEpoch()); abortErr != nil {
-					errs = append(errs, abortErr)
-				}
+			if abortErr := manager.AbortGeneration(c.PolicyEpoch()); abortErr != nil {
+				errs = append(errs, abortErr)
 			}
 		}
 	}
@@ -2829,9 +3105,9 @@ func (c *ControlPlane) releaseRetainedState() {
 		return
 	}
 
-	if handoff, owned := c.takeDNSHandoffController(); owned && handoff != nil {
-		_ = handoff.Close()
-	}
+	// Detach the handoff slot so the retired plane no longer references the
+	// controller. It is not owned here, so it is deliberately left open.
+	c.takeDNSHandoffController()
 	c.bpfMaintenance = nil
 	c.ClearReloadDnsCacheSource()
 }
@@ -2972,5 +3248,5 @@ func (c *ControlPlane) StartPreparedDNSListener() error {
 	if c == nil {
 		return nil
 	}
-	return c.startPreparedDNSListener(c.ctx, c.log, &c.deferFuncs, c.stopOwnedDNSListener)
+	return c.startPreparedDNSListener(c.ctx, &c.deferFuncs, c.stopOwnedDNSListener)
 }

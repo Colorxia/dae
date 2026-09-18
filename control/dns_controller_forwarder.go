@@ -298,6 +298,9 @@ func newDnsForwarderKey(upstream *dns.Upstream, dialArg *dialArgument) dnsForwar
 }
 
 func (c *DnsController) getOrCreateDnsForwarder(upstream *dns.Upstream, dialArg *dialArgument) (*cachedDnsForwarder, error) {
+	if c.dnsForwardersClosed.Load() {
+		return nil, ErrDnsForwardersClosed
+	}
 	key := newDnsForwarderKey(upstream, dialArg)
 	now := time.Now()
 
@@ -349,6 +352,18 @@ func (c *DnsController) getOrCreateDnsForwarder(upstream *dns.Upstream, dialArg 
 		}
 		return nil, fmt.Errorf("unexpected cached dns forwarder type: %T", actual)
 	}
+	if c.dnsForwardersClosed.Load() {
+		// The controller was closed between the entry check and this store.
+		// Stores that landed before the sweep's Range reaches the key get
+		// swept anyway; stores that land after the sweep passed would never
+		// be closed by anyone, so undo this one and fail the in-flight
+		// query instead. closeNow routes through the cached wrapper's
+		// closeOnce, keeping the double-close with a concurrent sweep
+		// idempotent.
+		c.dnsForwarderCache.CompareAndDelete(key, created)
+		_ = created.closeNow()
+		return nil, ErrDnsForwardersClosed
+	}
 	return created, nil
 }
 
@@ -392,6 +407,11 @@ func (c *DnsController) closeAllDnsForwarders() []error {
 	if c == nil {
 		return nil
 	}
+	// Set the closed flag before sweeping: combined with the post-store
+	// recheck in getOrCreateDnsForwarder, this makes it impossible for an
+	// in-flight query to leave a freshly created forwarder in the cache
+	// after this sweep returns (see the ordering argument there).
+	c.dnsForwardersClosed.Store(true)
 	var errs []error
 	c.dnsForwarderCache.Range(func(key, value any) bool {
 		k := key.(dnsForwarderKey)
@@ -473,6 +493,11 @@ func (c *DnsController) dialSend(
 	}
 	respMsg := resolution.response
 
+	// RFC 8305 resolution delay: this is the delivery side, so a non-preferred
+	// A/AAAA answer waits here for a preferred one without holding any shared
+	// resolution state.
+	respMsg = c.applyPreferenceWait(respMsg)
+
 	if resolution.upstreamIndex.IsReserved() && c.log.IsLevelEnabled(logrus.DebugLevel) {
 		var (
 			qname string
@@ -525,7 +550,7 @@ func (c *DnsController) dialSend(
 		// For responseWriter path, cache synchronously because
 		// responseWriter may need the message after we return.
 		if err = c.NormalizeAndCacheDnsResp_(respMsg, responseCacheKey); err != nil {
-			c.log.Warnf("failed to cache DNS response: %v", err)
+			c.noteDnsCacheStoreFailure("response writer", err)
 		}
 		return responseWriter.WriteMsg(respMsg)
 	}
@@ -537,28 +562,15 @@ func (c *DnsController) dialSend(
 		return err
 	}
 
-	// Truncate oversized UDP responses with the TC bit set (RFC 1035) so the
-	// client retries over TCP. Without this the client receives a
-	// "noerror, 0 answer, tc=0" reply and believes the name has no
-	// addresses. The cache must keep the FULL response (a later TCP client
-	// query needs all answers), so a deep copy is taken before truncating.
+	// Truncate only the outgoing wire message, including oversized OPT options.
+	// Keep respMsg intact for asynchronous caching and later TCP retries.
 	limit := dnsDefaultUDPSize
 	if len(data) > limit {
 		var reqMsg dnsmessage.Msg
 		if err = reqMsg.Unpack(dnsRequestData); err == nil {
 			limit = dnsUDPResponseSizeLimit(&reqMsg)
 		}
-		if len(data) > limit {
-			fullResp := *respMsg
-			fullResp.Answer = append([]dnsmessage.RR(nil), respMsg.Answer...)
-			fullResp.Extra = append([]dnsmessage.RR(nil), respMsg.Extra...)
-			respMsg.Truncate(limit)
-			data, err = respMsg.PackBuffer((*bufPtr)[:cap(*bufPtr)])
-			if err != nil {
-				return err
-			}
-			respMsg = &fullResp
-		}
+		data = truncateDNSResponse(data, limit)
 	}
 
 	if err = sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.replySoMark(), req.downloadRecorder()); err != nil {
@@ -575,7 +587,7 @@ func (c *DnsController) dialSend(
 			}
 		}()
 		if err := c.NormalizeAndCacheDnsResp_(respMsg, responseCacheKey); err != nil {
-			c.log.Debugf("failed to cache DNS response (async): %v", err)
+			c.noteDnsCacheStoreFailure("async after send", err)
 		}
 	}()
 

@@ -1,6 +1,13 @@
+/*
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+ */
+
 package control
 
 import (
+	"encoding/binary"
+	"net"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -8,6 +15,7 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
+	"github.com/sirupsen/logrus"
 )
 
 // Dae event types mirror enum dae_event_type in control/kern/tproxy.c.
@@ -16,6 +24,35 @@ const (
 	daeEventUdpConnOverflow
 	daeEventTcpConnOverflow
 	daeEventBlockedAlive
+	// daeEventRedirectRebindRejected: a competing publisher tried to steal a
+	// reply binding that is still fresh (P1-8).
+	daeEventRedirectRebindRejected
+	// daeEventSynRebindRejected: a pure SYN was refused rewrite of a live
+	// flow's routing metadata (P3-14).
+	daeEventSynRebindRejected
+	// daeEventReservedStatelessTcpPassthrough (6) and
+	// daeEventReservedFragTailPassed (7) are reserved and never emitted. Both
+	// described a by-design passthrough whose normal steady state (established
+	// TCP of a pre-existing flow after a restart, a forwarded fragment tail)
+	// cannot be reported per event: their rate key was shared by every
+	// affected flow, so the ringbuf delivered one sample per second for as
+	// long as the state lasted. The datapath counts them per packet in
+	// bpf_stats_map instead, and ControlPlane.reportDatapathPassthroughSummary
+	// reports the interval delta. The numbers stay reserved so the remaining
+	// types keep their wire values, and
+	// TestDaeEventTypeNumbersMatchKernelSource pins that numbering.
+	daeEventReservedStatelessTcpPassthrough
+	daeEventReservedFragTailPassed
+	// daeEventRedirectUpdateFailed: redirect_track could not store a reply
+	// binding (P2-29). The matching bpf_stats_map counter separates a full
+	// map from any other update error.
+	daeEventRedirectUpdateFailed
+	// daeEventSynRebindRerouted: a pure SYN re-created a live flow's cached
+	// routing because the flow belonged to an older routing epoch or datapath
+	// generation. This is the expected, counted outcome of a staged reload
+	// handoff that let a connection drain: the connection is not cut, and the
+	// next SYN moves it onto the current rules.
+	daeEventSynRebindRerouted
 )
 
 // daeEvent mirrors struct dae_event in control/kern/tproxy.c. The kernel writes
@@ -47,7 +84,7 @@ func parseDaeEventWithABI(abi bpfHostABI, b []byte) (e daeEvent) {
 	copy(e.Pname[:], b[16:32])
 	e.Outbound = b[32]
 	e.L4proto = b[33]
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		e.Sip[i] = abi.uint32(b[36+4*i : 40+4*i])
 		e.Dip[i] = abi.uint32(b[52+4*i : 56+4*i])
 	}
@@ -121,6 +158,27 @@ func (r *bpfMaintenanceRuntime) readEvents() {
 		switch ev.Type {
 		case daeEventUdpConnOverflow, daeEventTcpConnOverflow:
 			r.requestOverflow(target)
+		case daeEventRedirectUpdateFailed:
+			// redirect_track could not store a reply binding. Reply traffic
+			// for that flow is lost until the map drains, so run a janitor
+			// round (which also cleans redirect_track sooner under
+			// pressure) in addition to the warning below.
+			r.requestOverflow(target)
+			reportDatapathAnomaly(target, &ev, "redirect_track update failed: reply binding not stored")
+		case daeEventRedirectRebindRejected:
+			reportDatapathAnomaly(target, &ev, "reply binding kept against a competing publisher (still fresh)")
+		case daeEventSynRebindRejected:
+			reportDatapathAnomaly(target, &ev, "pure SYN refused rewrite of a live flow's routing metadata")
+		case daeEventSynRebindRerouted:
+			reportDatapathFlowEvent(target, &ev, "pure SYN moved a live flow that outlived a rules change onto the current routing epoch")
+		case daeEventReservedStatelessTcpPassthrough, daeEventReservedFragTailPassed:
+			// Both types are reserved and never emitted; see the type table
+			// above. The matching bpf_stats_map counters reach the operator
+			// through reportDatapathPassthroughSummary instead, so an event
+			// of these types can only mean the binaries disagree (the kernel
+			// object and this Go side ship together): report that as the ABI
+			// drift it is, without reviving the per-event warning.
+			logrus.Debugf("reserved datapath event type %d received; kernel object and userspace disagree", ev.Type)
 		case daeEventBlockedAlive:
 			// Kernel blocked a packet because the selected outbound is
 			// not alive (wan_outbound_is_alive == false). Userspace never
@@ -132,8 +190,70 @@ func (r *bpfMaintenanceRuntime) readEvents() {
 			// event emission per outbound (1/s), so this cannot storm the
 			// probe workers.
 			target.handleBlockedAliveEvent(&ev)
+		default:
+			// Unknown types cannot be acted on, but they must not be dropped
+			// in silence: kernel events and this binary ship together, so an
+			// unknown type means the ABI drifted.
+			logrus.Debugf("ignoring unknown datapath event type %d", ev.Type)
 		}
 	}
+}
+
+// reportDatapathAnomaly logs a kernel-reported datapath anomaly. The kernel
+// rate-limits each anomaly event type to one emission per second, but the rate
+// key is shared by every flow of that type: the bound is on the log, not on the
+// condition, and the tuple carried here is one arbitrary sample of it. That is
+// why only genuine anomalies belong on this path: a by-design steady state is
+// counted per packet and summarised by reportDatapathPassthroughSummary
+// instead. The per-packet counters in bpf_stats_map remain the authoritative
+// count either way.
+func reportDatapathAnomaly(c *ControlPlane, ev *daeEvent, msg string) {
+	reportDatapathEventAt(c, logrus.WarnLevel, ev, msg)
+}
+
+// reportDatapathFlowEvent logs a per-flow datapath decision that is by
+// design rather than an anomaly — the live flow whose next pure SYN adopts
+// the current routing epoch after a staged reload handoff. Under the
+// grading rule (per-flow or per-connection decisions are debug-level) it
+// carries the same tuple at debug level; the bpf_stats_map counter
+// BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE remains the authoritative
+// count, and the health tick can surface it to operators regardless of
+// log level.
+func reportDatapathFlowEvent(c *ControlPlane, ev *daeEvent, msg string) {
+	reportDatapathEventAt(c, logrus.DebugLevel, ev, msg)
+}
+
+// reportDatapathEventAt is the shared formatter for kernel datapath event
+// reports; level is the only thing the two outlets disagree on.
+func reportDatapathEventAt(c *ControlPlane, level logrus.Level, ev *daeEvent, msg string) {
+	if c == nil || c.log == nil {
+		return
+	}
+	c.log.Logf(level, "datapath anomaly: %s (type=%d pid=%d outbound=%d l4proto=%d %s:%d > %s:%d)",
+		msg, ev.Type, ev.Pid, ev.Outbound, ev.L4proto,
+		netIPString(ev.Sip), netPortString(ev.Sport),
+		netIPString(ev.Dip), netPortString(ev.Dport))
+}
+
+// netPortString renders a port from a ringbuf record. The kernel copies the
+// network-order port field verbatim, so it is re-encoded with the same ABI
+// before being decoded as big-endian.
+func netPortString(port uint16) uint16 {
+	var b [2]byte
+	nativeBpfABI.putUint16(b[:], port)
+	return binary.BigEndian.Uint16(b[:])
+}
+
+// netIPString renders the kernel event address pair. The kernel stores the
+// address words in host byte order inside the ringbuf record, so they are
+// re-encoded with the same ABI before formatting. IPv4-mapped addresses (the
+// kernel's canonical IPv4 form) are printed as plain IPv4.
+func netIPString(addr [4]uint32) string {
+	var b [16]byte
+	for i, word := range addr {
+		nativeBpfABI.putUint32(b[4*i:4*i+4], word)
+	}
+	return net.IP(b[:]).String()
 }
 
 // handleBlockedAliveEvent reacts to a kernel DAE_EVENT_BLOCKED_ALIVE by

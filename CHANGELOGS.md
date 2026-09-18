@@ -77,9 +77,14 @@ changed. Review them before upgrading:
   `223.5.5.5:53`. Users outside mainland China likely want to set
   `bootstrap_resolver` to a closer resolver.
 - `so_mark_from_dae` semantics: when the option is absent, dae now
-  auto-selects an internal fwmark for its own egress traffic instead of
-  leaving it unset. Setups whose policy routing matched on "no mark" must set
-  `so_mark_from_dae: 0` explicitly (an explicit `0` keeps the old behavior).
+  auto-selects an internal fwmark (`0x100`) for its own egress traffic instead
+  of leaving it unset, and warns about that implicit choice. An explicit `0`
+  does **not** restore the old "no mark" behavior: `0` still resolves to the
+  internal mark and only silences the warning, because that mark is what keeps
+  `wan_egress` from re-capturing the control plane's own UDP traffic
+  (`common/utils.go`, `config/desc.go`, `example.dae`). Setups whose policy
+  routing matched on "no mark" have to update that rule — match `0x100`, or set
+  `so_mark_from_dae` to a non-zero value of your own and match that.
 - New `disable_thp` option (default `false`) can opt the dae process out of
   transparent huge pages via `prctl(PR_SET_THP_DISABLE)`. The default leaves
   kernel memory policy untouched; enable it if you observe RSS inflation on
@@ -92,6 +97,67 @@ changed. Review them before upgrading:
   on abnormal exits (`Restart=on-abnormal`) with a crash-loop limit. dae also
   no longer derives `GOMEMLIMIT` from `memory.high` — only `memory.max`
   participates, and an explicit `GOMEMLIMIT` environment variable always wins.
+- A named parameter is now rejected on the routing functions that take bare
+  values (`pname`, `port`/`dport`, `sport`, `dscp`, `ip`/`dip`, `sip`,
+  `ipversion`, `l4proto`, `mac`, `qtype`, and the response-routing `upstream`).
+  The grammar accepts `key: value` inside every function call, and these
+  parsers used to ignore the key, so a mistyped parameter name was read as one
+  more operand: `port(bogus_param: 443)` silently built the same match set as
+  `port(443)` and `pname(bogus_param: 1)` matched a process named `1`, on both
+  the `dae run` and the `dae validate` path. Such a rule now fails with
+  `unsupported parameter key "bogus_param"` and names the accepted form. The
+  documented short form (`pname(NetworkManager)`, `port(443)`,
+  `dip(geoip:cn)`, `domain(geosite:cn, suffix:quay.io)`) is unaffected.
+
+  This one does not merely change a default: a config that used a parameter
+  name on these functions stops starting until the name is removed. That is the
+  point — the previous behaviour was a different rule, not the one written —
+  but it has to be reviewed before upgrading.
+- A truncated (TC=1) answer is now retried over TCP for the DNS upstreams that
+  can carry it, and only for those. RFC 7766 §5 requires a forwarder to retry a
+  truncated answer over TCP, and RFC 1035 §4.2.1 permits a server to answer
+  TC=1 when the answer does not fit one datagram; dae used to lose that signal:
+
+  - `udp://`: the retry is now performed, and the TCP forwarder is built from
+    the rewritten transport (it used to be rejected with `unexpected scheme:
+    udp`, so the retry never left the process and the client got TC=1);
+  - `tcp+udp://`: unchanged, it already retried on every UDP failure;
+  - as-is (the built-in transparent destination, or any other scheme): not
+    retried. As-is means "ask the server the request was addressed to, as the
+    request arrived" (see `docs/*/configuration/dns.md`), so the TC=1 answer the
+    destination sent is passed to the client verbatim, with no TCP connection
+    opened on the client's behalf and no second upstream selection. The client
+    decides for itself whether to retry over TCP, exactly as it would without
+    dae in the path. When the client's own UDP size limit is what truncated the
+    answer, the existing client-facing TC=1 path is unchanged.
+
+  A successful upgrade delivers the complete answer where the client used to
+  receive TC=1, so no configuration change is needed; the observable difference
+  is that these answers now resolve on the first query.
+- `GOMAXPROCS` is no longer pinned to `1`. The runtime default applies, so the
+  datapath uses more than one `P` on a multi-core host. An explicit
+  `GOMAXPROCS` environment variable still wins, so pinning it back to `1`
+  restores the previous behavior.
+- QUIC congestion control default: following the outbound dependency advance, a
+  QUIC connection whose path rate is unknown now gets the `bbr3` controller
+  instead of the previous default. `cc_override` still selects a controller per
+  outbound, and an unknown value there is rejected instead of ignored.
+- New `disable_waiting_network` option. Startup waits for the network before
+  pulling subscriptions, and that wait is now bounded: after the timeout dae
+  warns and resolves subscriptions anyway, so a host that never sees a default
+  route still finishes starting. Setting the option to `true` skips the wait.
+- Unknown operands for `l4proto` and `ipversion` are now rejected — e.g.
+  `l4proto: unknown value "sctp"; supported values are tcp and udp` — instead of
+  being silently ignored. This is the same class of change as the
+  named-parameter rejection above: a rule that used to be read as something
+  other than what it says now fails at parse time.
+- `dae validate` also dry-runs the DNS request/response routing block. A typo
+  there used to exit 0 from `validate` while `dae run` refused to start; scripts
+  that treat a successful `validate` as proof that the config will run now see
+  such configs fail, which is the point.
+- `ipversion_prefer` is enforced on every delivery path, including the
+  cache-hit and background-refresh paths that could previously release an answer
+  from the non-preferred family while the preferred family had records.
 
 ### v2.0.0rc1 (Pre-release)
 

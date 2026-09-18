@@ -76,11 +76,12 @@ func retireControlPlaneConnections(
 	ctx context.Context,
 	c retirementDrainPlane,
 	abort bool,
-	hasOverlap bool,
 	maxDrain time.Duration,
 ) {
-	_ = hasOverlap
-
+	// Retirement is two-stage: either abort everything when explicitly
+	// requested, or drain and then abort only the generation-owned pending
+	// work. Established connections are never aborted on a drain path: the
+	// successor generation is already serving those flows (see b7fb496d).
 	switch {
 	case abort:
 		log.Warnln("[Reload] Abort requested; aborting stale connections immediately")

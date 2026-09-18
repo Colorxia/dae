@@ -9,7 +9,6 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
-	"net"
 	"net/netip"
 	"strings"
 	"sync/atomic"
@@ -383,7 +382,7 @@ func sendPktWithResponseConnSlot(log *logrus.Logger, data []byte, from netip.Add
 		}
 	}
 
-	uConn, isNew, err := DefaultAnyfromPool.getOrCreateWithMark(bindAddr, soMark, AnyfromTimeout)
+	uConn, isNew, err := DefaultAnyfromPool.getOrCreateWithMark(bindAddr, soMark)
 	if err != nil {
 		if tryRawUDPFallback(log, data, from, realTo, soMark, debugEnabled, errorEnabled, "get-or-create", err) {
 			return nil
@@ -498,18 +497,18 @@ func forwardUdpEndpointReplyToClient(log *logrus.Logger, ue *UdpEndpoint, data [
 	return nil
 }
 
-func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision) (bool, error) {
+func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision) bool {
 	manager, _ := c.controlPlaneSessionManager()
 	if manager == nil {
-		return false, nil
+		return false
 	}
 	ue, ok := manager.retainedUDPEndpoint(src, realDst, routingResult, c.PolicyEpoch())
 	if !ok {
-		return false, nil
+		return false
 	}
 	if !c.checkUdpEndpointHealth(ue, true) {
 		ue.retire()
-		return true, nil
+		return true
 	}
 	if flowDecision.HasConfirmedQuicState() || ue.SniffedDomain != "" {
 		ue.UpdateNatTimeout(QuicNatTimeout)
@@ -519,7 +518,7 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 	if err != nil {
 		if isUdpEndpointWriteTolerated(err) {
 			// Transient write failure: drop the datagram, keep the session.
-			return true, nil
+			return true
 		}
 		if lifecycle, lifecycleOK := newUdpSessionLifecycleContext(ue, ""); lifecycleOK && c.shouldPenalizeUdpEndpointWriteError(err) {
 			lifecycle.reportUnavailable(fmt.Errorf("retained UDP endpoint write failed: %w", err))
@@ -531,7 +530,7 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 				"to":   realDst.String(),
 			}).WithError(err).Debug("Retired process-owned UDP endpoint after write failure")
 		}
-		return true, nil
+		return true
 	}
 	// The retained endpoint still belongs to this plane's connection, so
 	// meter it through the plane-bound recorder like every other egress
@@ -541,7 +540,7 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 	if lifecycle, lifecycleOK := newUdpSessionLifecycleContext(ue, ""); lifecycleOK {
 		lifecycle.reportTrafficSuccess()
 	}
-	return true, nil
+	return true
 }
 
 func currentPolicyUDPRoutingResult(stale *bpfRoutingResult) *bpfRoutingResult {
@@ -576,9 +575,9 @@ func (c *ControlPlane) prepareUnownedUDPCurrentPolicyFallback(src, dst netip.Add
 	return currentPolicyUDPRoutingResult(stale), true, err
 }
 
-func (c *ControlPlane) handlePktWithPrefetch(lConn *net.UDPConn, data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision, skipSniffing bool, prefetched *UdpEndpoint, prefetchKey UdpEndpointKey, prefetchOK bool) (err error) {
-	if handled, retainedErr := c.handleRetainedUDPEndpoint(data, src, realDst, routingResult, flowDecision); handled {
-		return retainedErr
+func (c *ControlPlane) handlePktWithPrefetch(data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision, prefetched *UdpEndpoint, prefetchKey UdpEndpointKey, prefetchOK bool) (err error) {
+	if c.handleRetainedUDPEndpoint(data, src, realDst, routingResult, flowDecision) {
+		return nil
 	}
 	owner, release, ownerErr := c.acquireRoutingEpochExecutionOwner(routingResult)
 	if ownerErr != nil {
@@ -587,18 +586,7 @@ func (c *ControlPlane) handlePktWithPrefetch(lConn *net.UDPConn, data []byte, sr
 				if retireErr != nil && c.log != nil && c.log.IsLevelEnabled(logrus.DebugLevel) {
 					c.log.WithError(retireErr).Debug("Failed to remove unowned stale UDP conn-state before current-policy fallback")
 				}
-				return c.handlePktOwned(
-					lConn,
-					data,
-					src,
-					realDst,
-					fallbackResult,
-					flowDecision,
-					skipSniffing,
-					nil,
-					UdpEndpointKey{},
-					false,
-				)
+				return c.handlePktOwned(data, src, realDst, fallbackResult, flowDecision, nil, UdpEndpointKey{}, false)
 			}
 		}
 		return fmt.Errorf("select UDP routing epoch owner: %w", ownerErr)
@@ -607,12 +595,12 @@ func (c *ControlPlane) handlePktWithPrefetch(lConn *net.UDPConn, data []byte, sr
 		defer release()
 	}
 	if owner != c {
-		return owner.handlePktOwned(lConn, data, src, realDst, routingResult, flowDecision, skipSniffing, prefetched, prefetchKey, prefetchOK)
+		return owner.handlePktOwned(data, src, realDst, routingResult, flowDecision, prefetched, prefetchKey, prefetchOK)
 	}
-	return c.handlePktOwned(lConn, data, src, realDst, routingResult, flowDecision, skipSniffing, prefetched, prefetchKey, prefetchOK)
+	return c.handlePktOwned(data, src, realDst, routingResult, flowDecision, prefetched, prefetchKey, prefetchOK)
 }
 
-func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision, skipSniffing bool, prefetched *UdpEndpoint, prefetchKey UdpEndpointKey, prefetchOK bool) (err error) {
+func (c *ControlPlane) handlePktOwned(data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision, prefetched *UdpEndpoint, prefetchKey UdpEndpointKey, prefetchOK bool) (err error) {
 	var realSrc netip.AddrPort
 	var domain string
 	var ueKey UdpEndpointKey
@@ -815,7 +803,7 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 
 	// To keep consistency with kernel program, we only sniff DNS request sent to 53.
 	var natTimeout time.Duration
-	if domain == "" && !skipSniffing && !ueExists {
+	if domain == "" && !ueExists {
 		// Fast path: only sniff-eligible QUIC Initial packets should enter sniffing.
 		// All other UDP traffic should be forwarded immediately without blocking.
 		if !isQuicInitial {
@@ -1058,6 +1046,21 @@ getNew:
 			NowNano:        nowNano,
 			sessionManager: sessionManager,
 			egressRuntime:  c.egressRuntime,
+			// The batch aggregator is the only component that knows how many
+			// datagrams really left the socket, so it owns the upload meter
+			// and the health report for batched endpoints. The plain
+			// (non-batched) path keeps the inline accounting below.
+			SentReporter: func(sent *UdpEndpoint, datagrams, bytes int) {
+				if bytes > 0 {
+					c.recordUploadTraffic(int64(bytes))
+				}
+				if datagrams <= 0 {
+					return
+				}
+				if lifecycle, ok := newUdpSessionLifecycleContext(sent, ""); ok {
+					lifecycle.reportTrafficSuccess()
+				}
+			},
 			GetDialOption: func(ctx context.Context) (option *DialOption, err error) {
 				dialParam := &proxyDialParam{
 					Outbound:    consts.OutboundIndex(routingResult.Outbound),
@@ -1073,7 +1076,7 @@ getNew:
 					Excluded:    excludedDialer,
 				}
 
-				res, err := c.chooseProxyDialer(ctx, dialParam)
+				res, err := c.chooseProxyDialer(dialParam)
 				if err != nil {
 					if res != nil && res.Outbound != nil && stderrors.Is(err, ob.ErrNoAliveDialer) {
 						res.Outbound.HandleNoAliveDialer(
@@ -1146,6 +1149,12 @@ getNew:
 	}
 	ue.TrackUdpConnStateTuplePair(realSrc, realDst)
 
+	// A batched endpoint only queues the datagram inside WriteTo; the flush
+	// reports the real bytes and the health signal from the aggregator's
+	// reportFlushed. Counting here would meter datagrams that a later failed or
+	// never-run flush dropped, and mark the dialer healthy for them (P3-25).
+	batchOwnsAccounting := ue.sentReporter != nil
+
 	for packetIndex < len(payloads) {
 		_, err = ue.WriteTo(payloads[packetIndex], dialTarget)
 		if err != nil {
@@ -1183,11 +1192,15 @@ getNew:
 			retry++
 			goto getNew
 		}
-		c.recordUploadTraffic(int64(len(payloads[packetIndex])))
+		if !batchOwnsAccounting {
+			c.recordUploadTraffic(int64(len(payloads[packetIndex])))
+		}
 		packetIndex++
 	}
-	if lifecycle, ok := newUdpSessionLifecycleContext(ue, ""); ok {
-		lifecycle.reportTrafficSuccess()
+	if !batchOwnsAccounting {
+		if lifecycle, ok := newUdpSessionLifecycleContext(ue, ""); ok {
+			lifecycle.reportTrafficSuccess()
+		}
 	}
 
 	// Per-flow routing traces are Debug, and only for new endpoints.

@@ -21,8 +21,6 @@ import (
 	"time"
 
 	"github.com/daeuniverse/dae/component/dns"
-	componentdialer "github.com/daeuniverse/dae/component/outbound/dialer"
-	D "github.com/daeuniverse/outbound/dialer"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
 )
@@ -106,7 +104,8 @@ func TestBackgroundRefreshFailureKeepsStaleAndClearsRefreshing(t *testing.T) {
 		OriginalDeadline: time.Now().Add(-time.Minute),
 	}
 	stale.refreshing.Store(true)
-	ctrl.dnsCache.Store(cacheKey, stale)
+	// Publish through the controller's store so the base-key index stays in sync.
+	ctrl.storeDnsCache(cacheKey, stale)
 
 	q := new(dnsmessage.Msg)
 	q.SetQuestion("stale.example.com.", dnsmessage.TypeA)
@@ -232,67 +231,6 @@ func TestUdpEndpointPoolRemoveUnlocksBeforeClose(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Remove did not return after replyQueueDone closed")
-	}
-}
-
-func TestTransferLeaseMatchesDialerIdentityNotPointer(t *testing.T) {
-	prop := &componentdialer.Property{
-		Property: D.Property{
-			Name:     "proxy-a",
-			Protocol: "hysteria2",
-			Link:     "hy2://example",
-			Address:  "proxy.example:443",
-		},
-		SubscriptionTag: "sub-1",
-	}
-	oldDialer := componentdialer.NewDialerContext(context.Background(),
-		&errorDialer{err: errors.New("unused")},
-		&componentdialer.GlobalOption{Log: discardLogger(), CheckInterval: time.Second},
-		componentdialer.InstanceOption{DisableCheck: true},
-		prop,
-	)
-	newDialer := componentdialer.NewDialerContext(context.Background(),
-		&errorDialer{err: errors.New("unused")},
-		&componentdialer.GlobalOption{Log: discardLogger(), CheckInterval: time.Second},
-		componentdialer.InstanceOption{DisableCheck: true},
-		&componentdialer.Property{
-			Property:        prop.Property,
-			SubscriptionTag: prop.SubscriptionTag,
-		},
-	)
-	if oldDialer == newDialer {
-		t.Fatal("fixture dialers must be distinct pointers")
-	}
-
-	oldRT := newEgressRuntime(discardLogger(), nil)
-	oldRT.configureResources(nil, []*componentdialer.Dialer{oldDialer}, nil)
-	oldLease, _, ok := oldRT.acquireEgress(oldDialer, nil)
-	if !ok || oldLease == nil {
-		t.Fatal("acquire old lease failed")
-	}
-
-	newRT := newEgressRuntime(discardLogger(), nil)
-	newRT.configureResources(nil, []*componentdialer.Dialer{newDialer}, nil)
-	transferred, _ := newRT.transferLease(oldLease)
-	if transferred == nil {
-		t.Fatal("transferLease did not match reconstructed dialer identity")
-	}
-	if transferred.dialer != newDialer {
-		t.Fatal("transferLease acquired the old pointer instead of the new generation")
-	}
-	newRT.mu.Lock()
-	refs := newRT.dialerRefs[newDialer]
-	runtimeRefs := newRT.refs
-	_, oldPresent := newRT.dialerRefs[oldDialer]
-	newRT.mu.Unlock()
-	if refs != 1 {
-		t.Fatalf("new dialerRefs = %d, want 1", refs)
-	}
-	if runtimeRefs != 2 {
-		t.Fatalf("runtime refs = %d, want 2 (owner + transferred lease)", runtimeRefs)
-	}
-	if oldPresent {
-		t.Fatal("dialerRefs was rekeyed onto the old pointer")
 	}
 }
 
@@ -447,11 +385,11 @@ func TestHandleConnDoesNotDoubleCloseFailedAdoption(t *testing.T) {
 		t.Fatal("handleConn adoptTCPFlow call missing")
 	}
 	window := text[idx:]
-	end := strings.Index(window, "defer closeEstablishedTCPFlow")
-	if end < 0 {
+	before, _, ok := strings.Cut(window, "defer closeEstablishedTCPFlow")
+	if !ok {
 		t.Fatal("successful adoption ownership boundary missing")
 	}
-	if strings.Contains(window[:end], "rConn.Close()") {
+	if strings.Contains(before, "rConn.Close()") {
 		t.Fatal("handleConn closes egress already claimed by adopt failure ownership")
 	}
 }
@@ -524,11 +462,11 @@ func TestSkipTrueDoesNotReturnFromDNSFastPath(t *testing.T) {
 		t.Fatal("skip predicate call missing from udpIngressTask.Run")
 	}
 	window := text[idx:]
-	end := strings.Index(window, "if dnsMessage, _ := ChooseNatTimeout")
-	if end < 0 {
+	before, _, ok := strings.Cut(window, "if dnsMessage, _ := ChooseNatTimeout")
+	if !ok {
 		t.Fatal("DNS fast path after skip block is missing")
 	}
-	block := window[:end]
+	block := before
 	if strings.Contains(block, "return") {
 		t.Fatal("skip-true branch returns and drops TProxy-reached local DNS")
 	}

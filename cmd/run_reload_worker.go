@@ -73,18 +73,19 @@ func (w *reloadWorker) run() {
 		reloadStartedAtMono := req.requestedAtMono
 
 		if req.isSuspend {
-			w.log.Warnln("[Reload] Received suspend signal; prepare to suspend")
+			w.log.Infoln("[Reload] Received suspend signal; prepare to suspend")
 		} else {
-			w.log.Warnln("[Reload] Received reload signal; prepare to reload")
+			w.log.Infoln("[Reload] Received reload signal; prepare to reload")
 		}
 		_ = sdnotify.Reloading()
 		_ = setRunSignalProgress(consts.ReloadProcessing, "")
 		w.reloadManager.setReloadError(nil)
 		resetReloadProxyRuntimeState()
+		resetReloadFilterRegexpCache()
 
 		// Load new config.
 		abortConnections := os.Remove(AbortFile) == nil
-		w.log.Warnln("[Reload] Load new config")
+		w.log.Infoln("[Reload] Load new config")
 		var newConf *config.Config
 		if req.isSuspend {
 			newConf, err = emptyConfig()
@@ -156,6 +157,11 @@ func (w *reloadWorker) run() {
 		failSupervisorStep := func(err error, step string, candidate *runtimeGeneration, preCleanup, postCleanup func()) {
 			reloadErr := fmt.Errorf("%s: %w", step, err)
 			w.reloadManager.setReloadError(reloadErr)
+			// The candidate already applied its disable_thp policy process-wide
+			// before the supervisor steps; restore the still-active generation's
+			// policy so a failed reload cannot leak the rejected memory policy
+			// (prctl(PR_SET_THP_DISABLE) is per-mm and idempotent).
+			configureTransparentHugePages(w.log, w.conf.Global.DisableTHP)
 			if preCleanup != nil {
 				preCleanup()
 			}
@@ -194,19 +200,13 @@ func (w *reloadWorker) run() {
 			dnsConfigUnchanged,
 			ipVersionPreferenceUnchanged,
 		)
-		var dnsCache map[string]*control.DnsCache
-		if ipVersionPreferenceUnchanged && !streamStagedDnsCache {
-			// Only keep dns cache when ip version preference not change.
-			dnsCache = w.c.CloneDnsCache()
-		}
-		rollbackDNSCache := dnsCache
+		dnsCache, rollbackDNSCache := cloneReloadDNSCaches(w.conf, newConf, stagedHotHandoff, w.c.CloneDnsCache)
 		var stagedListener *control.Listener
 
 		if stagedHotHandoff {
-			w.log.Warnln("[Reload] Prepare staged same-port handoff")
+			w.log.Infoln("[Reload] Prepare staged same-port handoff")
 			ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
 			newC, prepareErr := newPreparedControlPlane(ctx, w.log, reloadBpf, dnsCache, newConf, w.externGeoDataDirs, dnsConfigUnchanged, true)
-			dnsCache = nil
 			prepareErr = attachPreparedSessionManager(newC, w.processSessions, prepareErr)
 			if prepareErr != nil {
 				reloadErr := wrapReloadTimeoutError("prepare staged reload", prepareErr, reloadPrepareTimeout)
@@ -250,14 +250,14 @@ func (w *reloadWorker) run() {
 				continue
 			}
 
-			if ipVersionPreferenceUnchanged {
+			if dnsCachePolicyEqual(oldConf, newConf) {
 				if streamStagedDnsCache {
 					newC.SetReloadDnsCacheStreamSource(oldC.StreamDnsCacheForReload, oldC.PolicyIdentity().Hash())
 				} else {
 					newC.SetReloadDnsCacheSource(oldC.CloneDnsCache)
 				}
 			}
-			hasOverlap := newC.InheritDialerHealthFrom(oldC)
+			newC.InheritDialerHealthFrom(oldC)
 			configureTransparentHugePages(w.log, newConf.Global.DisableTHP)
 			activeGeneration := &runtimeGeneration{
 				controlPlane: oldC,
@@ -279,7 +279,7 @@ func (w *reloadWorker) run() {
 				failSupervisorStep(err, "install staged reload candidate", candidateGeneration, nil, nil)
 				continue
 			}
-			handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections, hasOverlap)
+			handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections)
 			handoff.preparedDNSHandoff = true
 			handoff.sharedBpfHandoff = true
 			w.reloadManager.setPendingStagedHandoff(handoff, reloadStartedAt, reloadStartedAtMono)
@@ -290,14 +290,13 @@ func (w *reloadWorker) run() {
 		}
 
 		if freshDatapathHandoff {
-			w.log.Warnln("[Reload] Prepare fresh datapath handoff")
+			w.log.Infoln("[Reload] Prepare fresh datapath handoff")
 			ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
 			freshState, prepareErr := w.c.SnapshotFreshDatapathState()
 			var newC *control.ControlPlane
 			if prepareErr == nil {
 				newC, prepareErr = newPreparedControlPlane(ctx, w.log, freshState, dnsCache, newConf, w.externGeoDataDirs, false, true)
 			}
-			dnsCache = nil
 			prepareErr = attachPreparedSessionManager(newC, w.processSessions, prepareErr)
 			if prepareErr != nil {
 				reloadErr := wrapReloadTimeoutError("prepare fresh datapath reload", prepareErr, reloadPrepareTimeout)
@@ -327,7 +326,7 @@ func (w *reloadWorker) run() {
 			oldConf := w.conf
 			oldListener := w.listener
 
-			hasOverlap := newC.InheritDialerHealthFrom(oldC)
+			newC.InheritDialerHealthFrom(oldC)
 			configureTransparentHugePages(w.log, newConf.Global.DisableTHP)
 			activeGeneration := &runtimeGeneration{
 				controlPlane: oldC,
@@ -349,7 +348,7 @@ func (w *reloadWorker) run() {
 				failSupervisorStep(err, "install fresh datapath reload candidate", candidateGeneration, nil, nil)
 				continue
 			}
-			handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections, hasOverlap)
+			handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections)
 			handoff.freshDatapath = true
 			w.reloadManager.setPendingStagedHandoff(handoff, reloadStartedAt, reloadStartedAtMono)
 			w.reloadManager.beginHandoff()
@@ -363,11 +362,10 @@ func (w *reloadWorker) run() {
 			w.log.Warnf("[Reload] Failed to stop old DNS listener: %v", err)
 		}
 
-		w.log.Warnln("[Reload] Load new control plane")
+		w.log.Infoln("[Reload] Load new control plane")
 		ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
 		newC, err := newControlPlane(ctx, w.log, reloadBpf, dnsCache, newConf, w.externGeoDataDirs, dnsConfigUnchanged, true)
 		err = attachPreparedSessionManager(newC, w.processSessions, err)
-		dnsCache = nil // Allow previous generation's clone to be GC'd.
 
 		var newCancel context.CancelFunc
 		if err != nil {
@@ -403,7 +401,7 @@ func (w *reloadWorker) run() {
 			w.log.Errorln("[Reload] Last reload failed; rolled back configuration")
 		} else {
 			newCancel = cancel
-			w.log.Warnln("[Reload] Prepared new control plane")
+			w.log.Infoln("[Reload] Prepared new control plane")
 		}
 
 		if stagedListener == nil {
@@ -446,7 +444,7 @@ func (w *reloadWorker) run() {
 		oldCancel := w.currCancel
 		oldConf := w.conf
 
-		hasOverlap := newC.InheritDialerHealthFrom(oldC)
+		newC.InheritDialerHealthFrom(oldC)
 		configureTransparentHugePages(w.log, newConf.Global.DisableTHP)
 		activeGeneration := &runtimeGeneration{
 			controlPlane: oldC,
@@ -483,7 +481,7 @@ func (w *reloadWorker) run() {
 			failSupervisorStep(err, "install reload candidate", candidateGeneration, restoreBpfOwnership, restartOldDNSListener)
 			continue
 		}
-		handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections, hasOverlap)
+		handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections)
 		handoff.bpfTransferred = !freshDatapathReload
 		w.reloadManager.setPendingStagedHandoff(handoff, reloadStartedAt, reloadStartedAtMono)
 		w.reloadManager.clearPendingRetirement()
@@ -491,7 +489,7 @@ func (w *reloadWorker) run() {
 		w.reloadManager.beginHandoff()
 		releaseReloadTransition()
 
-		w.reloadManager.refreshPprofServer(w.log, &w.pprofServer, newConf.Global.PprofPort)
+		w.reloadManager.refreshPprofServer(&w.pprofServer, newConf.Global.PprofPort)
 
 		notifyRunStateChange(w.runStateChanges)
 

@@ -105,11 +105,8 @@ func rewriteAndLoadBpf(ipVersion int, l4ProtoNo uint16, port int) (_ *bpfObjects
 	opts.Programs.LogLevel = ebpf.LogLevelInstruction
 	objs := bpfObjects{}
 	if err := spec.LoadAndAssign(&objs, &opts); err != nil {
-		var (
-			ve          *ebpf.VerifierError
-			verifierLog string
-		)
-		if errors.As(err, &ve) {
+		var verifierLog string
+		if ve, ok := errors.AsType[*ebpf.VerifierError](err); ok {
 			verifierLog = fmt.Sprintf("Verifier error: %+v\n", ve)
 		}
 		return nil, fmt.Errorf("failed to load BPF: %w\n%s", err, verifierLog)
@@ -266,6 +263,7 @@ type traceStats struct {
 	ipVersionFail uint64
 	l4ProtoFail   uint64
 	portFail      uint64
+	l4Unknown     uint64
 }
 
 func readTraceStats(objs *bpfObjects) (traceStats, error) {
@@ -279,6 +277,7 @@ func readTraceStats(objs *bpfObjects) (traceStats, error) {
 		&stats.ipVersionFail,
 		&stats.l4ProtoFail,
 		&stats.portFail,
+		&stats.l4Unknown,
 	}
 	for key, value := range values {
 		k := uint32(key)
@@ -324,8 +323,15 @@ func handleEvents(ctx context.Context, objs *bpfObjects, outputFile string, kfre
 		L3Proto     uint16
 		L4Proto     uint8
 		TcpFlags    uint8
-		PayloadLen  uint16
+		PayloadLen  uint32
 	}
+
+	// The kernel encodes "the headers do not carry this value" explicitly
+	// instead of wrapping around a narrow field; keep the rendering honest.
+	const (
+		traceL4Unknown         = 0xff
+		tracePayloadLenUnknown = 0xffffffff
+	)
 
 	skb2events := make(map[uint64][]bpfEvent)
 	// a map to save slices of bpfEvent of the Skb
@@ -361,7 +367,14 @@ func handleEvents(ctx context.Context, objs *bpfObjects, outputFile string, kfre
 			if skbEv.L4Proto == syscall.IPPROTO_TCP {
 				_, _ = fmt.Fprintf(writer, "tcp_flags=%s ", TcpFlags(skbEv.TcpFlags))
 			}
-			_, _ = fmt.Fprintf(writer, "payload_len=%d ", skbEv.PayloadLen)
+			if skbEv.L4Proto == traceL4Unknown {
+				_, _ = fmt.Fprintf(writer, "l4_proto=unknown ")
+			}
+			if skbEv.PayloadLen == tracePayloadLenUnknown {
+				_, _ = fmt.Fprintf(writer, "payload_len=unknown ")
+			} else {
+				_, _ = fmt.Fprintf(writer, "payload_len=%d ", skbEv.PayloadLen)
+			}
 			sym := NearestSymbol(skbEv.Pc)
 			_, _ = fmt.Fprintf(writer, "%s", sym.Name)
 			if sym.Name == "kfree_skb_reason" {
@@ -387,7 +400,7 @@ func handleEvents(ctx context.Context, objs *bpfObjects, outputFile string, kfre
 			logrus.Debugf("failed to read trace stats: %+v", err)
 			return
 		}
-		_, _ = fmt.Fprintf(writer, "# trace_stats read_events=%d pending_skb=%d handle_skb=%d filter_fail=%d match=%d ringbuf_fail=%d delete=%d ip_version_fail=%d l4_proto_fail=%d port_fail=%d\n",
+		_, _ = fmt.Fprintf(writer, "# trace_stats read_events=%d pending_skb=%d handle_skb=%d filter_fail=%d match=%d ringbuf_fail=%d delete=%d ip_version_fail=%d l4_proto_fail=%d port_fail=%d l4_unknown=%d\n",
 			readEvents,
 			len(skb2events),
 			stats.handleSkb,
@@ -398,11 +411,12 @@ func handleEvents(ctx context.Context, objs *bpfObjects, outputFile string, kfre
 			stats.ipVersionFail,
 			stats.l4ProtoFail,
 			stats.portFail,
+			stats.l4Unknown,
 		)
 		if readEvents != 0 {
 			return
 		}
-		logrus.Warnf("no trace events were received; bpf_stats: handle_skb=%d filter_fail=%d match=%d ringbuf_fail=%d delete=%d ip_version_fail=%d l4_proto_fail=%d port_fail=%d",
+		logrus.Warnf("no trace events were received; bpf_stats: handle_skb=%d filter_fail=%d match=%d ringbuf_fail=%d delete=%d ip_version_fail=%d l4_proto_fail=%d port_fail=%d l4_unknown=%d",
 			stats.handleSkb,
 			stats.filterFail,
 			stats.match,
@@ -411,6 +425,7 @@ func handleEvents(ctx context.Context, objs *bpfObjects, outputFile string, kfre
 			stats.ipVersionFail,
 			stats.l4ProtoFail,
 			stats.portFail,
+			stats.l4Unknown,
 		)
 	}
 	for {

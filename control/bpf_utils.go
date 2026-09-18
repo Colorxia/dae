@@ -95,10 +95,23 @@ func (o *bpfObjects) newLpmMap(keys []_bpfLpmKey, values []uint32) (m *ebpf.Map,
 
 func cidrToBpfLpmKey(prefix netip.Prefix) _bpfLpmKey {
 	bits := prefix.Bits()
-	if prefix.Addr().Is4() {
+	addr := prefix.Addr()
+	if addr.Is4In6() && bits <= 32 {
+		// An IPv4-mapped prefix written with an IPv4 bit count
+		// (::ffff:1.2.3.0/24, plus the 16-byte encoding used by geoip .dat
+		// data). The datapath always encodes IPv4 in the mapped form
+		// (::ffff:a.b.c.d with a 96+bits prefix length), so storing the
+		// first `bits` bits of the mapped address - which are all zero -
+		// would match every IPv4 address. Unmap first and let the Is4
+		// branch below re-add the 96-bit mapping offset. A bit count above
+		// 32 already is the mapped spelling of an IPv4 prefix and needs no
+		// rewrite. Keep this rule identical to pkg/trie.Prefix2bin128.
+		addr = addr.Unmap()
+	}
+	if addr.Is4() {
 		bits += 96
 	}
-	ip := prefix.Addr().As16()
+	ip := addr.As16()
 	return _bpfLpmKey{
 		PrefixLen: uint32(bits),
 		Data:      common.Ipv6ByteSliceToUint32Array(ip[:]),
@@ -128,7 +141,7 @@ func initBatchDeleteFeatureFlags() {
 	})
 }
 
-func BpfMapBatchUpdate(m *ebpf.Map, keys interface{}, values interface{}, opts *ebpf.BatchOptions) (n int, err error) {
+func BpfMapBatchUpdate(m *ebpf.Map, keys any, values any, opts *ebpf.BatchOptions) (n int, err error) {
 	CheckBatchUpdateFeatureOnce.Do(func() {
 		version, e := internal.KernelVersion()
 		if e != nil {
@@ -182,7 +195,7 @@ func BpfMapBatchUpdate(m *ebpf.Map, keys interface{}, values interface{}, opts *
 // number of entries actually deleted. The kernel stops a batch at the first
 // missing key, so ENOENT must resume at the following key instead of being
 // treated as success for the unprocessed suffix.
-func BpfMapBatchDelete(m *ebpf.Map, keys interface{}) (n int, err error) {
+func BpfMapBatchDelete(m *ebpf.Map, keys any) (n int, err error) {
 	initBatchDeleteFeatureFlags()
 
 	vKeys := reflect.ValueOf(keys)
@@ -191,7 +204,7 @@ func BpfMapBatchDelete(m *ebpf.Map, keys interface{}) (n int, err error) {
 	}
 
 	if !SimulateBatchDelete {
-		n, err = batchDeleteIgnoringMissing(vKeys, func(suffix interface{}) (int, error) {
+		n, err = batchDeleteIgnoringMissing(vKeys, func(suffix any) (int, error) {
 			return m.BatchDelete(suffix, &ebpf.BatchOptions{})
 		})
 		if err != nil {
@@ -216,7 +229,7 @@ func BpfMapBatchDelete(m *ebpf.Map, keys interface{}) (n int, err error) {
 	return deleted, nil
 }
 
-func batchDeleteIgnoringMissing(vKeys reflect.Value, deleteBatch func(keys interface{}) (int, error)) (deleted int, err error) {
+func batchDeleteIgnoringMissing(vKeys reflect.Value, deleteBatch func(keys any) (int, error)) (deleted int, err error) {
 	length := vKeys.Len()
 	for cursor := 0; cursor < length; {
 		remaining := length - cursor
@@ -245,10 +258,16 @@ func batchDeleteIgnoringMissing(vKeys reflect.Value, deleteBatch func(keys inter
 	return deleted, nil
 }
 
-// detectCgroupPath returns the first-found mount point of type cgroup2
-// and stores it in the cgroupPath global variable.
-// Copied from https://github.com/cilium/ebpf/blob/v0.10.0/examples/cgroup_skb/main.go
+var detectCgroupPathCached = sync.OnceValues(scanCgroupPath)
+
+// detectCgroupPath returns the first-found mount point of type cgroup2,
+// caching the result for the lifetime of the process to avoid repeatedly
+// scanning /proc/mounts on reloads or multiple setups.
 func detectCgroupPath() (string, error) {
+	return detectCgroupPathCached()
+}
+
+func scanCgroupPath() (string, error) {
 	f, err := os.Open("/proc/mounts")
 	if err != nil {
 		return "", err
@@ -290,16 +309,31 @@ func (p bpfIfParams) CheckVersionRequirement(version *internal.Version) (err err
 }
 
 type loadBpfOptions struct {
-	PinPath                string
-	BigEndianTproxyPort    uint32
-	CollectionOptions      *ebpf.CollectionOptions
-	ConnStateMapMaxEntries uint32
-	DatapathGeneration     uint16
+	PinPath                    string
+	BigEndianTproxyPort        uint32
+	CollectionOptions          *ebpf.CollectionOptions
+	ConnStateMapMaxEntries     uint32
+	RedirectTrackMapMaxEntries uint32
+	DatapathGeneration         uint16
 }
 
 const (
 	defaultConnStateMapMaxEntries = 65536 * 4
+	// defaultRedirectTrackMapMaxEntries mirrors MAX_REDIRECT_TRACK_NUM in
+	// kern/tproxy.c and is cross-checked against the compiled map capacity by
+	// tuneRedirectTrackMap. The C default is deliberately kept: raising it to
+	// 262144 must be justified by measuring resident memory first (HASH
+	// without preallocation only preallocates the bucket array, so the cost
+	// is dominated by live entries: roughly 24 B value + 48 B key + element
+	// overhead per entry), see the D4 report.
+	defaultRedirectTrackMapMaxEntries = 65536
 )
+
+// The blocked-event rate-limit contract values (blockedEventRateKey,
+// blockedEventRateWindowNs, expectedInjectedVariables, eventRateValue) live
+// in event_rate_contract.go, which compiles under both the real-eBPF build
+// and the dae_stub_ebpf test build so the parity tests can pin them against
+// the kernel source.
 
 // bpfDataplanePrograms mirrors the always-on datapath programs declared in the
 // generated bpfPrograms, but WITHOUT the opt-in tcp_offload_* programs. It is the
@@ -350,7 +384,6 @@ type bpfDataplaneMaps struct {
 	PktScratchMap            *ebpf.Map `ebpf:"pkt_scratch_map"`
 	RedirectTrack            *ebpf.Map `ebpf:"redirect_track"`
 	RouteCtxScratchMap       *ebpf.Map `ebpf:"route_ctx_scratch_map"`
-	RoutingEpochMap          *ebpf.Map `ebpf:"routing_epoch_map"`
 	RoutingHandoffMap        *ebpf.Map `ebpf:"routing_handoff_map"`
 	RoutingMap               *ebpf.Map `ebpf:"routing_map"`
 	RoutingMetaMap           *ebpf.Map `ebpf:"routing_meta_map"`
@@ -368,9 +401,9 @@ type bpfDataplane struct {
 }
 
 func loadBpfObjectsWithConstantsAndCustomizer(
-	obj interface{},
+	obj any,
 	opts *ebpf.CollectionOptions,
-	constants map[string]interface{},
+	constants map[string]any,
 	customize func(spec *ebpf.CollectionSpec) error,
 ) error {
 	spec, err := loadBpf()
@@ -378,8 +411,22 @@ func loadBpfObjectsWithConstantsAndCustomizer(
 		return err
 	}
 	for name, value := range constants {
-		if err := spec.Variables[name].Set(value); err != nil {
+		v, ok := spec.Variables[name]
+		if !ok || v == nil {
+			return fmt.Errorf("inject eBPF constant %q: variable not found in collection spec; the kernel-side declaration was likely removed or renamed — keep the Go-side constants map in sync with kern/tproxy.c .rodata variables", name)
+		}
+		if err := v.Set(value); err != nil {
 			return err
+		}
+	}
+	// Completeness guard: every expected .rodata variable must actually be
+	// injected above. A variable missing from the constants map would
+	// otherwise silently fall back to its C-side initializer (e.g. the
+	// clang fallback of EVENT_RATE), and a map geometry derived on the Go
+	// side could diverge from the value the kernel actually runs with.
+	for _, name := range expectedInjectedVariables {
+		if _, ok := constants[name]; !ok {
+			return fmt.Errorf("eBPF constant %q is expected to be injected but missing from the constants map", name)
 		}
 	}
 	if customize != nil {
@@ -417,13 +464,63 @@ func tuneConnStateBpfMap(spec *ebpf.CollectionSpec, maxEntries uint32) error {
 	return nil
 }
 
-func customizeBpfMapSpecs(spec *ebpf.CollectionSpec, connStateMapMaxEntries uint32) error {
+// tuneRedirectTrackMap is the single owner of the redirect_track capacity.
+// The map is declared in kern/tproxy.c with MAX_REDIRECT_TRACK_NUM, and
+// userspace used to carry a second hard-coded copy of the same number for its
+// usage warnings; the two could drift silently. Here the compiled capacity is
+// cross-checked against the Go constant (defaultRedirectTrackMapMaxEntries,
+// which mirrors the C macro) and any divergence fails the load instead of
+// quietly resizing or mis-reporting. Growth past the C default is an explicit
+// decision: HASH without preallocation only preallocates the bucket array, so
+// raising it costs memory only as entries are actually used.
+func tuneRedirectTrackMap(spec *ebpf.CollectionSpec, maxEntries uint32) error {
+	if spec == nil {
+		return fmt.Errorf("nil collection spec")
+	}
+	if maxEntries == 0 {
+		maxEntries = defaultRedirectTrackMapMaxEntries
+	}
+	m, ok := spec.Maps["redirect_track"]
+	if !ok || m == nil {
+		return fmt.Errorf("missing map spec %q", "redirect_track")
+	}
+	if m.MaxEntries != maxEntries {
+		return fmt.Errorf("redirect_track capacity %d diverges from the expected %d (MAX_REDIRECT_TRACK_NUM in kern/tproxy.c and defaultRedirectTrackMapMaxEntries in bpf_utils.go must agree)",
+			m.MaxEntries, maxEntries)
+	}
+	m.MaxEntries = maxEntries
+	return nil
+}
+
+func customizeBpfMapSpecs(spec *ebpf.CollectionSpec, connStateMapMaxEntries, redirectTrackMapMaxEntries uint32) error {
 	if err := disablePinnedConnStateMaps(spec); err != nil {
 		return err
 	}
 	if err := tuneConnStateBpfMap(spec, connStateMapMaxEntries); err != nil {
 		return err
 	}
+	return tuneRedirectTrackMap(spec, redirectTrackMapMaxEntries)
+}
+
+// tuneEventRateMap derives the alive_block_rate_map capacity from the same
+// userspace-owned reserved keys that get injected into the EVENT_RATE rodata
+// variable, so the key domain and the ARRAY geometry share a single owner
+// (the map definition on the C side can only reference a compile-time
+// fallback constant). The derived invariant matches the C fallback exactly:
+// capacity = highest reserved key + 1.
+func tuneEventRateMap(spec *ebpf.CollectionSpec) error {
+	if spec == nil {
+		return fmt.Errorf("nil collection spec")
+	}
+	m, ok := spec.Maps["alive_block_rate_map"]
+	if !ok || m == nil {
+		return fmt.Errorf("missing map spec %q", "alive_block_rate_map")
+	}
+	want := eventRateMapKeyMax + 1
+	if m.MaxEntries != want {
+		return fmt.Errorf("alive_block_rate_map capacity %d diverges from the userspace-owned reserved event rate key %d (+1 slot) in EVENT_RATE; the C fallback and Go constants are out of sync", m.MaxEntries, eventRateMapKeyMax)
+	}
+	m.MaxEntries = want
 	return nil
 }
 
@@ -479,6 +576,21 @@ func cleanupEphemeralBpfPinDirs(log *logrus.Logger, pinPath string) int {
 		}
 	}
 	return removed
+}
+
+// logRemovedIncompatiblePinnedMap reports the removal of a pinned map whose
+// layout the new datapath object rejects. Removal is destructive -- the map
+// holds live connection/session or redirect state and the reloaded program
+// starts with an empty one -- so this is a warning that names the map, the pin
+// path, and the consequence for established flows, not a step notice.
+func logRemovedIncompatiblePinnedMap(log *logrus.Logger, mapName, pinPath string) {
+	if log == nil {
+		return
+	}
+	log.WithFields(logrus.Fields{
+		"map":      mapName,
+		"pin_path": filepath.Join(pinPath, mapName),
+	}).Warn("Removed incompatible pinned map: the new datapath object requires a different map layout, so the map's contents (connection tracking / redirect state) are lost and established flows fall back to a fresh decision")
 }
 
 func fullLoadBpfObjects(
@@ -542,7 +654,7 @@ retryLoadBpf:
 		log.Warnf("Kernel does not support bpf_get_current_task helper: %v; process names may be truncated or less accurate (degraded to bpf_get_current_comm)", err)
 	}
 
-	constants := map[string]interface{}{
+	constants := map[string]any{
 		"PARAM": struct {
 			tproxyPort           uint32
 			controlPlanePid      uint32
@@ -566,6 +678,7 @@ retryLoadBpf:
 			datapathGeneration:   opts.DatapathGeneration,
 			daeSocketMark:        soMarkFromDae,
 		},
+		"EVENT_RATE": eventRateValue(),
 	}
 	var dataplane bpfDataplane
 	if err = loadBpfObjectsWithConstantsAndCustomizer(
@@ -573,7 +686,10 @@ retryLoadBpf:
 		opts.CollectionOptions,
 		constants,
 		func(spec *ebpf.CollectionSpec) error {
-			return customizeBpfMapSpecs(spec, opts.ConnStateMapMaxEntries)
+			if err := customizeBpfMapSpecs(spec, opts.ConnStateMapMaxEntries, opts.RedirectTrackMapMaxEntries); err != nil {
+				return err
+			}
+			return tuneEventRateMap(spec)
 		},
 	); err != nil {
 		if errors.Is(err, ebpf.ErrMapIncompatible) {
@@ -593,7 +709,7 @@ retryLoadBpf:
 				return fmt.Errorf("remove incompatible pinned map %q: %w", mapName, rmErr)
 			}
 			retries++
-			log.Infof("Incompatible new map format with existing map %v detected; removed the old one.", mapName)
+			logRemovedIncompatiblePinnedMap(log, mapName, opts.PinPath)
 			goto retryLoadBpf
 		}
 		// Get detailed log from ebpf.internal.(*VerifierError)
@@ -687,7 +803,6 @@ func assignDataplaneToBpf(bpf *bpfObjects, dp *bpfDataplane) {
 	bpf.PktScratchMap = dp.PktScratchMap
 	bpf.RedirectTrack = dp.RedirectTrack
 	bpf.RouteCtxScratchMap = dp.RouteCtxScratchMap
-	bpf.RoutingEpochMap = dp.RoutingEpochMap
 	bpf.RoutingHandoffMap = dp.RoutingHandoffMap
 	bpf.RoutingMap = dp.RoutingMap
 	bpf.RoutingMetaMap = dp.RoutingMetaMap

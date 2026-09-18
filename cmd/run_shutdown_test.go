@@ -783,7 +783,7 @@ func TestReloadManagerStartRetirementSkipsClosedSupervisor(t *testing.T) {
 	}
 	_ = supervisor.shutdown()
 
-	manager.startControlPlaneRetirement(newDiscardLogger(), oldGeneration.controlPlane, nil, oldGeneration.cancel, false, false, supervisor, retiring)
+	manager.startControlPlaneRetirement(newDiscardLogger(), oldGeneration.controlPlane, nil, oldGeneration.cancel, false, supervisor, retiring)
 	manager.lastRetirementMu.Lock()
 	task := manager.activeRetirement
 	manager.lastRetirementMu.Unlock()
@@ -853,14 +853,15 @@ func TestDNSConfigFingerprintCoversAllDnsFields(t *testing.T) {
 	// would cause unnecessary domain_routing_map clear+replay during
 	// staged handoff (dae#1013).
 	excluded := map[string]struct{}{
-		"OptimisticCache":    {},
-		"OptimisticCacheTtl": {},
-		"MaxCacheSize":       {},
+		"OptimisticCache":         {},
+		"OptimisticCacheTtl":      {},
+		"OptimisticStaleReplyTtl": {},
+		"MaxCacheSize":            {},
 	}
 
-	dnsType := reflect.TypeOf(config.Dns{})
-	for i := 0; i < dnsType.NumField(); i++ {
-		name := dnsType.Field(i).Name
+	dnsType := reflect.TypeFor[config.Dns]()
+	for field := range dnsType.Fields() {
+		name := field.Name
 		if _, isExcluded := excluded[name]; isExcluded {
 			continue
 		}
@@ -1156,7 +1157,7 @@ func TestReloadManagerStartControlPlaneRetirementCompletesAndCancelsOldContext(t
 	if err != nil {
 		t.Fatalf("publishPrepared() error = %v", err)
 	}
-	manager.startControlPlaneRetirement(newDiscardLogger(), oldGeneration.controlPlane, nil, oldCancel, false, false, supervisor, retiringGeneration)
+	manager.startControlPlaneRetirement(newDiscardLogger(), oldGeneration.controlPlane, nil, oldCancel, false, supervisor, retiringGeneration)
 
 	manager.mu.Lock()
 	retirementDone := manager.pendingRetirementDone
@@ -1182,7 +1183,7 @@ func TestReloadManagerStartControlPlaneRetirementCompletesAndCancelsOldContext(t
 }
 
 func TestReloadManagerRepeatedRetirementLifecycleReclaimsGeneration(t *testing.T) {
-	for iteration := 0; iteration < 64; iteration++ {
+	for iteration := range 64 {
 		manager := newReloadManager(make(chan reloadRequest, 1), make(chan struct{}, 1), make(chan os.Signal, 1))
 		manager.setPendingReloadMetadata(time.Now(), 0)
 
@@ -1204,7 +1205,6 @@ func TestReloadManagerRepeatedRetirementLifecycleReclaimsGeneration(t *testing.T
 			oldGeneration.controlPlane,
 			nil,
 			oldCancel,
-			false,
 			false,
 			supervisor,
 			retiring,
@@ -1482,20 +1482,17 @@ func (r *retirementBehaviorPlane) StopRoutingEpochExecutionWithTimeout(time.Dura
 }
 
 func TestReloadRetirementBehavior(t *testing.T) {
+	// The retired address-overlap dimension is gone: retirement is two-stage
+	// and no longer varies with whether the generations share listen addresses.
 	tests := []struct {
 		name        string
-		overlap     bool
 		abort       bool
 		expectDrain bool
 	}{
-		{"staged_overlap_no_abortfile_graceful", true, false, true},
-		{"staged_no_overlap_no_abortfile_graceful", false, false, true},
-		{"staged_overlap_abortfile_immediate_abort", true, true, false},
-		{"staged_no_overlap_abortfile_immediate_abort", false, true, false},
-		{"nonstaged_overlap_no_abortfile_graceful", true, false, true},
-		{"nonstaged_no_overlap_no_abortfile_graceful", false, false, true},
-		{"nonstaged_overlap_abortfile_immediate_abort", true, true, false},
-		{"nonstaged_no_overlap_abortfile_immediate_abort", false, true, false},
+		{"staged_no_abortfile_graceful", false, true},
+		{"staged_abortfile_immediate_abort", true, false},
+		{"nonstaged_no_abortfile_graceful", false, true},
+		{"nonstaged_abortfile_immediate_abort", true, false},
 	}
 
 	for _, tt := range tests {
@@ -1507,7 +1504,7 @@ func TestReloadRetirementBehavior(t *testing.T) {
 
 			go func() {
 				defer close(done)
-				retireControlPlaneConnections(newDiscardLogger(), context.Background(), plane, tt.abort, tt.overlap, 10*time.Second)
+				retireControlPlaneConnections(newDiscardLogger(), context.Background(), plane, tt.abort, 10*time.Second)
 			}()
 
 			if tt.expectDrain {
@@ -1553,7 +1550,7 @@ func TestReloadRetirementAbortWaitsForRoutingExecutionLeases(t *testing.T) {
 	}
 	done := make(chan struct{})
 	go func() {
-		retireControlPlaneConnections(newDiscardLogger(), context.Background(), plane, true, true, time.Second)
+		retireControlPlaneConnections(newDiscardLogger(), context.Background(), plane, true, time.Second)
 		close(done)
 	}()
 
@@ -1583,7 +1580,7 @@ func TestReloadRetirementAbortsPendingWorkAfterDrainTimeout(t *testing.T) {
 		fakeRetirementControlPlane: newFakeRetirementControlPlane(1),
 	}
 
-	retireControlPlaneConnections(newDiscardLogger(), context.Background(), plane, false, true, 10*time.Millisecond)
+	retireControlPlaneConnections(newDiscardLogger(), context.Background(), plane, false, 10*time.Millisecond)
 
 	if !plane.pendingAbortCalled.Load() || plane.abortCalled.Load() {
 		t.Fatal("expected only AbortPendingConnections after drain timeout")
@@ -1597,7 +1594,7 @@ func TestReloadRetirementAbortsPendingWorkAfterDrainCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	retireControlPlaneConnections(newDiscardLogger(), ctx, plane, false, true, time.Second)
+	retireControlPlaneConnections(newDiscardLogger(), ctx, plane, false, time.Second)
 
 	if !plane.pendingAbortCalled.Load() || plane.abortCalled.Load() {
 		t.Fatal("expected only AbortPendingConnections after drain cancellation")

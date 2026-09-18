@@ -25,10 +25,11 @@ type controlPlaneDNSRuntime struct {
 	// staged handoff — assembles the same behaviour. Patching them onto the
 	// option at one call site silently resets them to zero at the others,
 	// which turned the cache size limit off after a reload.
-	dnsOptimisticCache    bool
-	dnsOptimisticCacheTtl int
-	dnsMaxCacheSize       int
-	dnsIpVersionPrefer    int
+	dnsOptimisticCache         bool
+	dnsOptimisticCacheTtl      int
+	dnsOptimisticStaleReplyTtl int
+	dnsMaxCacheSize            int
+	dnsIpVersionPrefer         int
 
 	dnsListener               *DNSListener
 	dnsListenerStopRegistered bool
@@ -223,11 +224,11 @@ func (r *controlPlaneDNSRuntime) noteDNSUpstreamAvailable() {
 	})
 }
 
-func (r *controlPlaneDNSRuntime) startPreparedDNSListener(ctx context.Context, log *logrus.Logger, deferFuncs *[]func() error, stop func() error) error {
-	return r.startPreparedDNSListenerWithWarmupTimeout(ctx, log, deferFuncs, stop, preparedDNSWarmupTimeout)
+func (r *controlPlaneDNSRuntime) startPreparedDNSListener(ctx context.Context, deferFuncs *[]func() error, stop func() error) error {
+	return r.startPreparedDNSListenerWithWarmupTimeout(ctx, deferFuncs, stop, preparedDNSWarmupTimeout)
 }
 
-func (r *controlPlaneDNSRuntime) startPreparedDNSListenerWithWarmupTimeout(ctx context.Context, log *logrus.Logger, deferFuncs *[]func() error, stop func() error, warmupTimeout time.Duration) error {
+func (r *controlPlaneDNSRuntime) startPreparedDNSListenerWithWarmupTimeout(ctx context.Context, deferFuncs *[]func() error, stop func() error, warmupTimeout time.Duration) error {
 	if r == nil || !r.delayDNSListenerStart {
 		return nil
 	}
