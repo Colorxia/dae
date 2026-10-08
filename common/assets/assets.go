@@ -8,7 +8,6 @@ package assets
 import (
 	"errors"
 	"fmt"
-	"github.com/daeuniverse/dae/common/consts"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -18,6 +17,8 @@ import (
 	"time"
 
 	"github.com/adrg/xdg"
+	"github.com/daeuniverse/dae/common"
+	"github.com/daeuniverse/dae/common/consts"
 	"github.com/sirupsen/logrus"
 )
 
@@ -86,7 +87,6 @@ func (c *LocationFinder) GetLocationAsset(log *logrus.Logger, filename string) (
 				filepath.Join("/usr/share", folder),
 			)
 		}
-		searchDirs = append(searchDirs, c.externDirs...)
 	} else {
 		// add /etc/dae to search path
 		searchDirs = append(searchDirs, c.externDirs...)
@@ -111,9 +111,8 @@ func (c *LocationFinder) GetLocationAsset(log *logrus.Logger, filename string) (
 		searchPath := filepath.Join(searchDir, filename)
 		// Reject lexical ".." traversal. Symlink resolution remains governed
 		// by the trust assigned to configured asset directories.
-		if rel, relErr := filepath.Rel(searchDir, searchPath); relErr != nil ||
-			rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return "", fmt.Errorf("asset filename escapes search directory: %v", filename)
+		if err = common.EnsureFileInSubDir(searchPath, searchDir); err != nil {
+			return "", fmt.Errorf("asset filename escapes search directory: %v: %w", filename, err)
 		}
 		if _, err = os.Stat(searchPath); err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
@@ -125,5 +124,12 @@ func (c *LocationFinder) GetLocationAsset(log *logrus.Logger, filename string) (
 		// return the first path that exists
 		return searchPath, nil
 	}
-	return "", fmt.Errorf("%v: %w in [%v]", filename, os.ErrNotExist, strings.Join(searchDirs, ", "))
+	// Name the environment variable and whether this process actually saw it:
+	// DAE_LOCATION_ASSET is read from the daemon's own environment, so a value
+	// exported in an interactive shell is invisible to a process started by
+	// systemd or by a bare "sudo dae run" that resets the environment.
+	if location == "" {
+		return "", fmt.Errorf("%v: %w in [%v] (DAE_LOCATION_ASSET is not set; set it to the directory holding %v, or install the file into one of the searched directories)", filename, os.ErrNotExist, strings.Join(searchDirs, ", "), filename)
+	}
+	return "", fmt.Errorf("%v: %w in [%v] (DAE_LOCATION_ASSET=%q)", filename, os.ErrNotExist, strings.Join(searchDirs, ", "), location)
 }

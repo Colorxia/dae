@@ -164,8 +164,8 @@ type SessionManager struct {
 	tcpCount atomic.Int64
 	udpCount atomic.Int64
 
-	// generationsMu only guards the small epoch-count table plus flows whose
-	// PolicyEpoch migrates mid-reload. The per-packet data plane never takes it.
+	// generationsMu only guards the small epoch-count table and the lifecycle
+	// transactions that update it. The per-packet data plane never takes it.
 	generationsMu sync.Mutex
 	generations   map[routing.PolicyEpoch]*sessionGenerationState
 
@@ -416,31 +416,6 @@ func (f *FlowRuntime) Context() context.Context {
 		return context.Background()
 	}
 	return f.ctx
-}
-
-// Ingress returns the accepted transparent connection.
-func (f *FlowRuntime) Ingress() net.Conn {
-	if f == nil {
-		return nil
-	}
-	return f.ingress
-}
-
-// Egress returns the concrete outbound connection selected at establishment.
-// It is nil for locally terminated flows such as transparent DNS-over-TCP.
-func (f *FlowRuntime) Egress() netproxy.Conn {
-	if f == nil {
-		return nil
-	}
-	return f.egress
-}
-
-// Binding returns the immutable route and concrete egress decision.
-func (f *FlowRuntime) Binding() TcpFlowBinding {
-	if f == nil {
-		return TcpFlowBinding{}
-	}
-	return f.binding
 }
 
 func (m *SessionManager) adoptTCP(

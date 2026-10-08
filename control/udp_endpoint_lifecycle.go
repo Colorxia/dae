@@ -545,10 +545,6 @@ func isUdpEndpointWriteTolerated(err error) bool {
 	return stderrors.As(err, &tolerated)
 }
 
-// armWriteDeadline keeps a write deadline of [T/2, T] ahead of every write
-// while re-arming at most once per T/2 window. Transports that do not support
-// write deadlines return an error, which is deliberately ignored: they simply
-// keep their previous unbounded behaviour.
 // dialTargetForWrite returns the string form of the datagram's upstream
 // destination for WriteTo. Symmetric endpoints (non-zero Dst in the pool
 // key) have a fixed dial target stored once at creation, so the per-packet
@@ -593,6 +589,15 @@ func (ue *UdpEndpoint) maybeRebuildOnReplyDrought(now time.Time) error {
 	if drought < int64(udpEndpointReplyDroughtWindow) {
 		return nil
 	}
+	// Raise the threshold by the longest silence this session has already
+	// bridged while healthy: a flow whose reply cadence is naturally slower
+	// than the window (a slow-ack telemetry flow) would otherwise be rebuilt
+	// on every quiet gap — deterministically, because the gate fires before
+	// the next reply can land. After the cadence is learned, only a silence
+	// longer than anything the flow has survived counts as drought.
+	if gapFloor := int64(udpEndpointReplyDroughtWindow) + ue.maxReplyGapNano.Load(); drought < gapFloor {
+		return nil
+	}
 	if !ue.rebuildsOnReplyDrought() {
 		return nil
 	}
@@ -607,14 +612,15 @@ func (ue *UdpEndpoint) maybeRebuildOnReplyDrought(now time.Time) error {
 		// such as WireGuard's persistent keepalive must keep its source port.
 		return nil
 	}
-	ue.retiredByReplyDrought.Store(true)
 	if ue.poolRef != nil {
-		// Carry the recovery budget of this key forward before the endpoint is
-		// marked dead: a concurrent replacement could otherwise retire the
-		// stale entry, dial, and read the ledger in between, leaving the
-		// replacement with a fresh flow's budget.
+		// Carry the recovery budget of this key forward before the retirement
+		// flag becomes visible: a concurrent replacement could otherwise see
+		// the flag, dial, and read the ledger in between, leaving the
+		// replacement with a fresh flow's budget. The flag is the publication
+		// point of the retirement, so the ledger write must land first.
 		ue.poolRef.rememberDroughtRebuild(ue.poolKey, ue.droughtRebuildGeneration+1)
 	}
+	ue.retiredByReplyDrought.Store(true)
 	ue.retire()
 	if ue.log != nil {
 		dialerName := ""
@@ -627,6 +633,7 @@ func (ue *UdpEndpoint) maybeRebuildOnReplyDrought(now time.Time) error {
 			"dialer":             dialerName,
 			"proxy_addr":         ue.DialTarget,
 			"drought":            time.Duration(drought).String(),
+			"drought_floor":      time.Duration(int64(udpEndpointReplyDroughtWindow) + ue.maxReplyGapNano.Load()).String(),
 			"writes_since_reply": writes,
 		}).Debug("[UdpEndpoint] Rebuilding UDP session after reply drought")
 	}
@@ -662,23 +669,40 @@ func (ue *UdpEndpoint) droughtSendRate(writes, droughtNano int64, now time.Time)
 //
 // The counter covers the current absolute probe window; datagrams are counted
 // only after the transport accepted them, so evidence is never fabricated from
-// a datagram that was merely queued. The bucket is published after its counter
-// is cleared, so a reader that observes the new bucket cannot pair it with the
-// previous bucket's count. Concurrent writers may still lose a count, which
-// under-counts the window and therefore delays a rebuild instead of causing a
-// spurious one.
+// a datagram that was merely queued. The bucket transition is CAS-gated: the
+// winner publishes the new bucket and then seeds its counter with its own
+// datagrams, so the plain Store(0)-then-publish sequence can neither erase a
+// concurrent writer's count mid-transition nor attribute a straggler's write
+// to a bucket it does not belong to. A writer whose view of the bucket is
+// stale across a transition can still be dropped or misattributed once per
+// transition, which under-counts the window and therefore delays a rebuild
+// instead of causing a spurious one.
 func (ue *UdpEndpoint) observeSendRate(now time.Time, datagrams int) {
 	if ue == nil || datagrams <= 0 {
 		return
 	}
 	bucket := now.UnixNano() / int64(udpEndpointReplyDroughtProbeWindow)
-	if ue.recentWriteBucket.Load() != bucket {
-		ue.recentWriteBucketWrites.Store(0)
-		ue.recentWriteBucket.Store(bucket)
+	for {
+		cur := ue.recentWriteBucket.Load()
+		if cur == bucket {
+			ue.recentWriteBucketWrites.Add(int64(datagrams))
+			return
+		}
+		if ue.recentWriteBucket.CompareAndSwap(cur, bucket) {
+			// The winner publishes the new bucket first and then seeds the
+			// counter with its own datagrams: any concurrent Add that raced
+			// in between belonged to the retired bucket and is dropped with
+			// it, and every later Add lands on the fresh count.
+			ue.recentWriteBucketWrites.Store(int64(datagrams))
+			return
+		}
 	}
-	ue.recentWriteBucketWrites.Add(int64(datagrams))
 }
 
+// armWriteDeadline keeps a write deadline of [T/2, T] ahead of every write
+// while re-arming at most once per T/2 window. Transports that do not support
+// write deadlines return an error, which is deliberately ignored: they simply
+// keep their previous unbounded behaviour.
 func (ue *UdpEndpoint) armWriteDeadline(now time.Time) {
 	// Transports that declare a session-closing write deadline via the
 	// netproxy.WriteDeadlineBehavior contract (TUIC/Hysteria2: their
@@ -911,6 +935,18 @@ func (ue *UdpEndpoint) requiresInitialReplyGuard() bool {
 func (ue *UdpEndpoint) markReplied(nowNano int64, from netip.AddrPort) {
 	if nowNano == 0 {
 		nowNano = time.Now().UnixNano()
+	}
+	if prev := ue.lastReplyNano.Load(); prev != 0 && nowNano > prev {
+		// Record the observed inter-reply interval before the fresh timestamp
+		// lands: the drought gate treats a gap the flow itself has already
+		// bridged while healthy as normal cadence, not as evidence of death.
+		gap := nowNano - prev
+		for {
+			old := ue.maxReplyGapNano.Load()
+			if gap <= old || ue.maxReplyGapNano.CompareAndSwap(old, gap) {
+				break
+			}
+		}
 	}
 	ue.lastReplyNano.Store(nowNano)
 	// A reply is proof of life: the drought evidence starts over. The reply is

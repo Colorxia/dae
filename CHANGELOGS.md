@@ -162,6 +162,43 @@ changed. Review them before upgrading:
 #### Bug Fixes
 
 - fix(control): flush short TCP splice writes without corking
+- fix(control): gate the opt-in TCP sockmap offload on the transparent unwrap — the
+  outbound pin advance made wrapped proxy legs peelable, which would have redirected
+  client plaintext around TLS/framing when `DAE_ALLOW_TCP_SOCKMAP=1` is set
+- fix(control): learn a flow's observed reply cadence before calling a reply drought,
+  so a slow-ack flow is no longer rebuilt once per few reply periods
+- fix(dns): a datagram drop whose cause is a resolver timeout keeps waiting for the
+  reply instead of discarding the pooled connection, and the stale-drop cap keeps the
+  drop classification so it neither retires the forwarder nor skips the TCP retry
+- fix(sniffing): an HTTP Host is accepted only from a terminated header line, so a
+  Host value split across reads no longer routes by a truncated domain; QUIC CRYPTO
+  frame lengths and offsets are bounds-checked in the uint64 domain on every arch
+- fix(control): a transient cgroup2 probe failure is retried on the next reload
+  instead of disabling pname routing until restart
+- fix(outbound): dialer ranking applies `check_tolerance` only between two measured
+  dialers and reports class corrections in the selection log
+- fix(daedns): each leg of the node-address resolution race is bounded by the shared
+  10s lookup timeout, so a blackholed resolver cannot hang a node dial
+- fix(control): `SetSendRedirects`/`CheckSendRedirects` now write and verify
+  `conf/all/send_redirects` too — the kernel ORs it with the per-interface node,
+  so a "0" written only to `conf/<lan>` was inert while `conf/all` kept the
+  default 1 and the LAN still got ICMP redirects around dae (#1125)
+- fix(kern): a LAN UDP packet is passed to a local service only when the matched
+  socket is bound to the packet's exact destination address; a wildcard-bound
+  socket no longer swallows traffic addressed elsewhere, and port 53 never
+  bypasses routing (#1110)
+- fix(daedns): the bootstrap resolver and the system resolver are dialed
+  family-agnostically — the dial family follows the fixed resolver address, so a
+  v6-origin flow no longer fails with "no suitable address found" and disables
+  that resolution leg (#1130, plus the same fix on kdae's system-DNS leg)
+- fix(config): the digit-prefix error hint now tells the user to quote the whole
+  `name: value` entry (a quoted name alone cannot parse), and `dae validate`
+  dry-runs `dns.fixed_domain_ttl` parsing (#1124)
+- fix(config): `Marshaller.Bytes` is restored for embedding callers such as
+  dae-wing (#1117)
+- feat: log timestamps use `2006-01-02 15:04:05` with forced formatting (#1010)
+- chore(ebpf): the tproxy.c CO-RE comment no longer misattributes relocation
+  failure to GCC 15 DTE; the real cause is pahole mis-parsing DWARF5 (#1056)
 
 ### v2.0.0rc1 (Pre-release)
 

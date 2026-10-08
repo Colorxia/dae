@@ -109,11 +109,16 @@ type ControlPlane struct {
 	mptcp                  bool
 	udpRouteScopeSensitive bool
 	controlPlaneUDPRuntime
-	lastConnectionErrorLogTime     atomic.Int64
-	lastDnsFastPathErrorLogTime    atomic.Int64
-	lastDnsFastPathServfailLogTime atomic.Int64
-	lastHandlePktEpochWarnTime     atomic.Int64
-	tcpConnPanicCount              atomic.Uint64
+	// Rate limits for the per-connection/per-packet log conditions that used
+	// to carry their own hand-rolled CAS loops; pacedAlert keeps the same
+	// first-line-always-logs, then one line per cooldown, semantics.
+	connectionErrorLogAlert     pacedAlert
+	dnsFastPathErrorLogAlert    pacedAlert
+	dnsFastPathServfailLogAlert pacedAlert
+	// lastHandlePktEpochWarnTime cannot join the pacedAlert fields above:
+	// udp_epoch_pin_measure_test.go resets it directly to re-arm the pace.
+	lastHandlePktEpochWarnTime atomic.Int64
+	tcpConnPanicCount          atomic.Uint64
 	// The janitor map-capacity alerts are paced one per condition, not one per
 	// janitor run: see pacedAlert. They are per-map so that one saturated map
 	// cannot pace another map's alert out of the log.
@@ -163,6 +168,12 @@ var policyEpochSequence atomic.Uint64
 // DelayDNSListenerStart build a prepared candidate that does not touch the
 // kernel datapath until CommitPreparedDatapath; IsReload selects reload-mode
 // TC handle flipping and skips startup-only stale hook purges.
+// InheritedBpf is the eBPF object set a reload inherits from the previous
+// generation instead of loading a fresh datapath. It is an alias so the
+// unexported bpfObjects stays the canonical definition while cmd and tests
+// can name the handoff type.
+type InheritedBpf = bpfObjects
+
 type ControlPlaneBuildOptions struct {
 	DelayDatapathCommit   bool
 	DelayDNSListenerStart bool
@@ -171,6 +182,12 @@ type ControlPlaneBuildOptions struct {
 	DirectDialer          netproxy.Dialer
 	FullconeDirectDialer  netproxy.Dialer
 	SystemDNSResolver     *netutils.SystemDNSResolver
+	// Datapath inheritance: at most one of InheritedBpf (shared object
+	// handoff from the previous generation) and FreshDatapath (a flow-state
+	// snapshot applied to a fresh load) may be non-nil; both nil means a
+	// cold load.
+	InheritedBpf  *InheritedBpf
+	FreshDatapath *FreshDatapathState
 }
 
 var (
@@ -237,12 +254,17 @@ func ensureBpfPinDir(pinPath string, log *logrus.Logger) error {
 	if err == nil || os.IsExist(err) {
 		return nil
 	}
-	wrapped := bpfPinDirError(pinPath, err, isBpfPinRootMounted())
+	wrapped := bpfPinDirError(pinPath, err, probeBpfPinRootMount())
 	if log != nil {
 		log.Warnln(wrapped)
 	}
 	return wrapped
 }
+
+// probeBpfPinRootMount is the test seam over the real /proc/mounts probe:
+// hermetic tests substitute it so the reported branch does not depend on
+// whether the host actually mounted bpffs at the pin root.
+var probeBpfPinRootMount = isBpfPinRootMounted
 
 // bpfPinDirError builds the message from the observed state of the pin root.
 // Only a missing mount makes the mount advice actionable; a permission or
@@ -306,7 +328,6 @@ func isIPLikeDomain(domain string) bool {
 func NewControlPlaneWithContextOptions(
 	ctx context.Context,
 	log *logrus.Logger,
-	_bpf any,
 	dnsCache map[string]*DnsCache,
 	tagToNodeList map[string][]string,
 	groups []config.Group,
@@ -316,10 +337,10 @@ func NewControlPlaneWithContextOptions(
 	externGeoDataDirs []string,
 	buildOpts ControlPlaneBuildOptions,
 ) (plane *ControlPlane, err error) {
-	var freshDatapathState *FreshDatapathState
-	if state, ok := _bpf.(*FreshDatapathState); ok {
-		freshDatapathState = state
-		_bpf = nil
+	freshDatapathState := buildOpts.FreshDatapath
+	inheritedBpf := buildOpts.InheritedBpf
+	if freshDatapathState != nil && inheritedBpf != nil {
+		return nil, fmt.Errorf("inherited bpf objects and a fresh datapath snapshot are mutually exclusive")
 	}
 	// The ctx parameter may carry a preparation timeout from the caller (e.g.
 	// context.WithTimeout in cmd/run.go). All long-lived objects owned by the
@@ -428,7 +449,7 @@ func NewControlPlaneWithContextOptions(
 	}()
 	pinPath := filepath.Join(consts.BpfPinRoot, consts.AppName)
 	ephemeralPinPath := false
-	if _bpf == nil && buildOpts.IsReload {
+	if inheritedBpf == nil && buildOpts.IsReload {
 		pinPath = filepath.Join(pinPath, fmt.Sprintf("reload-%d-%d", os.Getpid(), time.Now().UnixNano()))
 		ephemeralPinPath = true
 	}
@@ -447,7 +468,7 @@ func NewControlPlaneWithContextOptions(
 	}
 
 	/// Load pre-compiled programs and maps into the kernel.
-	if _bpf == nil {
+	if inheritedBpf == nil {
 		// Conn-state maps are preserved across in-process reload via object handoff,
 		// so fresh loads should not inherit stale bpffs pins from previous processes.
 		if !ephemeralPinPath {
@@ -483,12 +504,8 @@ func NewControlPlaneWithContextOptions(
 	}
 
 	var bpf *bpfObjects
-	if _bpf != nil {
-		if obj, ok := _bpf.(*bpfObjects); ok {
-			bpf = obj
-		} else {
-			return nil, fmt.Errorf("unexpected bpf type: %T", _bpf)
-		}
+	if inheritedBpf != nil {
+		bpf = inheritedBpf
 	} else {
 		bpf = new(bpfObjects)
 		datapathGeneration := nextDatapathGeneration()
@@ -505,7 +522,7 @@ func NewControlPlaneWithContextOptions(
 		}
 		registerBpfDatapathGeneration(bpf, datapathGeneration)
 	}
-	sharedBpfReload := _bpf != nil
+	sharedBpfReload := inheritedBpf != nil
 	// Ensure critical maps are always present. DNS fast-path optimizations only
 	// skip per-flow map updates, never map object creation.
 	if err = validateRequiredBpfMapsLoaded(bpf); err != nil {
@@ -609,6 +626,7 @@ func NewControlPlaneWithContextOptions(
 	option.DaeDNS, err = daedns.NewWithOption(log, global, dnsConfig, &daedns.NewOption{
 		LocationFinder: locationFinder,
 		DirectDialer:   directDialer,
+		SystemDNS:      systemDNSResolver,
 	})
 	if err != nil {
 		return nil, err
@@ -1297,9 +1315,9 @@ func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 }
 
 func (c *ControlPlane) dnsUpstreamReadyCallback(dnsUpstream *dns.Upstream) (err error) {
-	if c != nil {
-		c.noteDNSUpstreamAvailable()
-	}
+	// The callback is only registered by the constructor on the plane it just
+	// built, so c is never nil here.
+	c.noteDNSUpstreamAvailable()
 	// Waiting for ready.
 	select {
 	case <-c.ctx.Done():
@@ -1624,12 +1642,12 @@ func (c *ControlPlane) runReloadRetirementCleanup(staleBeforeNs uint64) {
 		return
 	}
 
-	cleanupMu, _ := c.maintenanceState()
+	cleanupMu, scratch := c.maintenanceState()
 	cleanupMu.Lock()
-	redirectDeleted := c.cleanupRedirectTrackMapBeforeLocked(staleBeforeNs)
-	cookieDeleted := c.cleanupCookiePidMapBeforeLocked(staleBeforeNs)
-	routingHandoffDeleted := c.cleanupRoutingHandoffMapBeforeLocked(staleBeforeNs)
-	udpStats, tcpStats := c.cleanupConnStateMapBeforeLocked(true, staleBeforeNs)
+	redirectDeleted := c.cleanupRedirectTrackMapBeforeLocked(staleBeforeNs, scratch)
+	cookieDeleted := c.cleanupCookiePidMapBeforeLocked(staleBeforeNs, scratch)
+	routingHandoffDeleted := c.cleanupRoutingHandoffMapBeforeLocked(staleBeforeNs, scratch)
+	udpStats, tcpStats := c.cleanupConnStateMapBeforeLocked(true, staleBeforeNs, scratch)
 	cleanupMu.Unlock()
 
 	if c.log == nil {
@@ -1669,13 +1687,13 @@ const redirectTrackTimeout = 5 * time.Minute
 // cleanup of any other entry: redirect_track is a HASH map, so there is no LRU
 // eviction order for it to occupy.
 func (c *ControlPlane) cleanupRedirectTrackMap() int {
-	cleanupMu, _ := c.maintenanceState()
+	cleanupMu, scratch := c.maintenanceState()
 	cleanupMu.Lock()
 	defer cleanupMu.Unlock()
-	return c.cleanupRedirectTrackMapBeforeLocked(0)
+	return c.cleanupRedirectTrackMapBeforeLocked(0, scratch)
 }
 
-func (c *ControlPlane) cleanupRedirectTrackMapBeforeLocked(staleBeforeNs uint64) int {
+func (c *ControlPlane) cleanupRedirectTrackMapBeforeLocked(staleBeforeNs uint64, scratch *connStateJanitorScratch) int {
 	// Check if we're shutting down - if stop signal is sent, skip cleanup
 	select {
 	case <-c.stop:
@@ -1697,7 +1715,6 @@ func (c *ControlPlane) cleanupRedirectTrackMapBeforeLocked(staleBeforeNs uint64)
 
 	timeoutNano := redirectTrackTimeout.Nanoseconds()
 
-	scratch := c.connStateJanitorScratch()
 	keysToDelete := takeJanitorDeleteScratch(scratch.redirectDelete)
 	totalEntries := 0
 	maxAge := int64(0)
@@ -1770,13 +1787,13 @@ func (c *ControlPlane) cleanupRedirectTrackMapBeforeLocked(staleBeforeNs uint64)
 // cleanupCookiePidMap removes stale cookie->pid metadata that escaped the
 // cgroup sock_release backstop. Active sockets refresh last_seen_ns in BPF.
 func (c *ControlPlane) cleanupCookiePidMap() int {
-	cleanupMu, _ := c.maintenanceState()
+	cleanupMu, scratch := c.maintenanceState()
 	cleanupMu.Lock()
 	defer cleanupMu.Unlock()
-	return c.cleanupCookiePidMapBeforeLocked(0)
+	return c.cleanupCookiePidMapBeforeLocked(0, scratch)
 }
 
-func (c *ControlPlane) cleanupCookiePidMapBeforeLocked(staleBeforeNs uint64) int {
+func (c *ControlPlane) cleanupCookiePidMapBeforeLocked(staleBeforeNs uint64, scratch *connStateJanitorScratch) int {
 	select {
 	case <-c.stop:
 		return 0
@@ -1796,7 +1813,6 @@ func (c *ControlPlane) cleanupCookiePidMapBeforeLocked(staleBeforeNs uint64) int
 	nowNano := ts.Nano()
 	timeoutNano := cookiePidMapTimeout.Nanoseconds()
 
-	scratch := c.connStateJanitorScratch()
 	keysToDelete := takeJanitorDeleteScratch(scratch.cookiePidDelete)
 	keysOut := ensureJanitorLookupScratch(scratch.cookiePidKeys)
 	valuesOut := ensureJanitorLookupScratch(scratch.cookiePidValues)
@@ -1849,13 +1865,13 @@ func (c *ControlPlane) cleanupCookiePidMapBeforeLocked(staleBeforeNs uint64) int
 // The handoff map is a short-lived bridge for userspace consumers that miss the
 // authoritative conn-state publication window.
 func (c *ControlPlane) cleanupRoutingHandoffMap() int {
-	cleanupMu, _ := c.maintenanceState()
+	cleanupMu, scratch := c.maintenanceState()
 	cleanupMu.Lock()
 	defer cleanupMu.Unlock()
-	return c.cleanupRoutingHandoffMapBeforeLocked(0)
+	return c.cleanupRoutingHandoffMapBeforeLocked(0, scratch)
 }
 
-func (c *ControlPlane) cleanupRoutingHandoffMapBeforeLocked(staleBeforeNs uint64) int {
+func (c *ControlPlane) cleanupRoutingHandoffMapBeforeLocked(staleBeforeNs uint64, scratch *connStateJanitorScratch) int {
 	select {
 	case <-c.stop:
 		return 0
@@ -1873,7 +1889,6 @@ func (c *ControlPlane) cleanupRoutingHandoffMapBeforeLocked(staleBeforeNs uint64
 		return 0
 	}
 
-	scratch := c.connStateJanitorScratch()
 	keysToDelete := takeJanitorDeleteScratch(scratch.routingHandoffDelete)
 	keysOut := ensureJanitorLookupScratch(scratch.routingHandoffKeys)
 	valuesOut := ensureJanitorLookupScratch(scratch.routingHandoffValues)
@@ -2047,21 +2062,17 @@ func (c *ControlPlane) readDatapathCounters(m *ebpf.Map) (bpfStatsSnapshot, erro
 	return snap, nil
 }
 
+// allowDnsFastPathErrorLog rate-limits the DNS fast-path error warning.
 func (c *ControlPlane) allowDnsFastPathErrorLog(now time.Time) bool {
-	nowNano := now.UnixNano()
-	for {
-		last := c.lastDnsFastPathErrorLogTime.Load()
-		if nowNano-last < int64(dnsFastPathErrorLogInterval) {
-			return false
-		}
-		if c.lastDnsFastPathErrorLogTime.CompareAndSwap(last, nowNano) {
-			return true
-		}
-	}
+	_, emit := c.dnsFastPathErrorLogAlert.observe(now, dnsFastPathErrorLogInterval)
+	return emit
 }
 
 // allowHandlePktEpochWarn rate-limits the expected reload-window warning for
 // UDP packets whose stale routing-epoch attribution has no execution owner.
+// It keeps the hand-rolled CAS loop (instead of pacedAlert) because
+// udp_epoch_pin_measure_test.go resets lastHandlePktEpochWarnTime directly to
+// re-arm the pace for each exercised warning path.
 func (c *ControlPlane) allowHandlePktEpochWarn(now time.Time) bool {
 	nowNano := now.UnixNano()
 	for {
@@ -2075,17 +2086,10 @@ func (c *ControlPlane) allowHandlePktEpochWarn(now time.Time) bool {
 	}
 }
 
+// allowDnsFastPathServfailLog rate-limits the DNS fast-path SERVFAIL warning.
 func (c *ControlPlane) allowDnsFastPathServfailLog(now time.Time) bool {
-	nowNano := now.UnixNano()
-	for {
-		last := c.lastDnsFastPathServfailLogTime.Load()
-		if nowNano-last < int64(dnsFastPathErrorLogInterval) {
-			return false
-		}
-		if c.lastDnsFastPathServfailLogTime.CompareAndSwap(last, nowNano) {
-			return true
-		}
-	}
+	_, emit := c.dnsFastPathServfailLogAlert.observe(now, dnsFastPathErrorLogInterval)
+	return emit
 }
 
 // readBpfStatsCounter reads a counter from the BPF stats map by key index.
@@ -2198,14 +2202,6 @@ func udpDualStackListenControl(c syscall.RawConn) error {
 		return err
 	}
 	return enableUDPDualStackSocket(c)
-}
-
-func udpIngressSupportsBatch(conn *net.UDPConn) bool {
-	if conn == nil {
-		return false
-	}
-	_, ok := conn.LocalAddr().(*net.UDPAddr)
-	return ok
 }
 
 func wakeTCPListener(listener net.Listener) {
@@ -2672,11 +2668,12 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			// }
 		}
 
-		if udpIngressSupportsBatch(udpConn) {
-			batchReader := newUDPIngressBatchReader(udpConn, 0)
-			if batchReader == nil {
-				goto singleRead
-			}
+		// validateListener has already pinned packetConn to a non-nil
+		// *net.UDPConn, so batch construction never refuses in production; the
+		// single-read loop below only covers defensive construction failure,
+		// and udpIngressSingleReader is also constructed directly by tests.
+		batchReader := newUDPIngressBatchReader(udpConn, 0)
+		if batchReader != nil {
 			defer batchReader.Close()
 
 			for {
@@ -2710,7 +2707,6 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			return
 		}
 
-	singleRead:
 		var oob [udpIngressOobSize]byte
 		singleReader := udpIngressSingleReader{pc: udpConn}
 		for {
@@ -2735,9 +2731,8 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				continue
 			}
 
-			// Dual-stack UDP listener path: prefer correctness and IPv6 coverage
-			// over batch-read optimization. OOB is consumed synchronously in
-			// processPacket, so reusing the stack buffer is safe here.
+			// OOB is consumed synchronously in processPacket, so reusing the
+			// stack buffer is safe here.
 			processPacket(pktBuf, src, oob[:oobn])
 		}
 	}()
@@ -2806,24 +2801,6 @@ func (c *ControlPlane) Listen(port uint16) (listener *Listener, err error) {
 			_ = listener.Close()
 		}
 	}()
-
-	return listener, nil
-}
-
-func (c *ControlPlane) ListenAndServe(readyChan chan<- bool, port uint16) (listener *Listener, err error) {
-	listener, err = c.Listen(port)
-	if err != nil {
-		return nil, err
-	}
-
-	if err = c.Serve(readyChan, listener); err != nil {
-		// This wrapper created the sockets, so it owns them: close on failure
-		// so a retried startup cannot leave the previous attempt's listeners
-		// bound until GC. The caller receives nil on error, matching the
-		// historical contract.
-		_ = listener.Close()
-		return nil, fmt.Errorf("failed to serve: %w", err)
-	}
 
 	return listener, nil
 }

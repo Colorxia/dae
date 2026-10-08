@@ -20,6 +20,7 @@ import (
 
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/assets"
+	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/common/netutils"
 	componentdns "github.com/daeuniverse/dae/component/dns"
 	"github.com/daeuniverse/dae/component/dnstransport"
@@ -60,6 +61,7 @@ type Router struct {
 	subNodeMatcher        *compiledMatcher[NodeMeta]
 	bootstrapDns          []netip.AddrPort
 	directDialer          netproxy.Dialer
+	systemDNS             SystemDNSProvider
 	soMark                uint32
 	mptcp                 bool
 	lookupMu              sync.Mutex
@@ -93,6 +95,17 @@ type lookupCall struct {
 type NewOption struct {
 	LocationFinder *assets.LocationFinder
 	DirectDialer   netproxy.Dialer
+	// SystemDNS supplies this generation's direct DNS view for lookups that
+	// must not depend on dae DNS routing, such as a node address that no
+	// node/sub rule selected an upstream for.
+	SystemDNS SystemDNSProvider
+}
+
+// SystemDNSProvider exposes a generation's direct DNS view: the host resolver
+// with its configured fallback, and no routing rewrite.
+// *netutils.SystemDNSResolver implements it.
+type SystemDNSProvider interface {
+	SystemDNS() (netip.AddrPort, error)
 }
 
 type compiledMatcher[T any] struct {
@@ -130,6 +143,7 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 
 	locationFinder := assets.NewLocationFinder(nil)
 	directDialer := direct.SymmetricDirect
+	var systemDNS SystemDNSProvider
 	if opt != nil {
 		if opt.LocationFinder != nil {
 			locationFinder = opt.LocationFinder
@@ -137,6 +151,7 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 		if opt.DirectDialer != nil {
 			directDialer = opt.DirectDialer
 		}
+		systemDNS = opt.SystemDNS
 	}
 	requestProgram, err := componentdns.NewNormalizedRequestRoutingProgram(dnsCfg.Routing.Request.Rules, dnsCfg.Routing.Request.Fallback,
 		&routing.DatReaderOptimizer{Logger: log, LocationFinder: locationFinder},
@@ -157,6 +172,7 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 		log:                   log,
 		upstreams:             make(map[string]*componentdns.UpstreamResolver),
 		directDialer:          directDialer,
+		systemDNS:             systemDNS,
 		soMark:                common.EffectiveSoMarkFromDae(global.SoMarkFromDae),
 		mptcp:                 global.Mptcp,
 		lookupCalls:           make(map[string]*lookupCall),
@@ -170,15 +186,10 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 	if err = router.initUpstreams(dnsCfg.Upstream); err != nil {
 		return nil, err
 	}
-	upstreamName2Id := make(map[string]uint8, len(router.upstreamByIndex))
-	for i, upstreamRaw := range dnsCfg.Upstream {
-		tag, _ := common.GetTagFromLinkLikePlaintext(string(upstreamRaw))
-		if tag == "" {
-			continue
-		}
-		upstreamName2Id[tag] = uint8(i)
-	}
-	requestMatcherBuilder, err := componentdns.NewRequestMatcherBuilderFromProgram(log, requestProgram, upstreamName2Id)
+	// The shared namespace builder keeps this matcher resolving upstream names
+	// to the same ids dns.New assigns; initUpstreams rejects untagged entries,
+	// so those ids also index upstreamByIndex without renumbering.
+	requestMatcherBuilder, err := componentdns.NewRequestMatcherBuilderFromProgram(log, requestProgram, componentdns.UpstreamName2Id(dnsCfg))
 	if err != nil {
 		return nil, err
 	}
@@ -296,25 +307,23 @@ func (r *Router) replaceHTTPClient(previous *dnstransport.HTTPClientGeneration, 
 	next.Active = 1
 	r.httpClients[key] = next
 	r.httpClientGenerations[next] = struct{}{}
-	if previous != nil {
-		previous.Retired = true
-		if previous.Active == 0 {
-			closePrevious = true
-		}
-	}
+	closePrevious = dnstransport.RetireHTTPClientLocked(previous)
 	r.httpClientMu.Unlock()
-	if closePrevious {
-		previous.Close()
-		r.httpClientMu.Lock()
-		if previous.Retired && previous.Active == 0 {
-			delete(r.httpClientGenerations, previous)
-		}
-		r.httpClientMu.Unlock()
-	}
+	dnstransport.FinishRetiredHTTPClient(&r.httpClientMu, previous, closePrevious, func() {
+		delete(r.httpClientGenerations, previous)
+	})
 	return next
 }
 
 func (r *Router) initUpstreams(rawUpstreams []config.KeyableString) error {
+	// Mirror the bound dns.New enforces: UpstreamName2Id truncates each raw
+	// index to uint8, so beyond it the id would collide with the reserved
+	// reject/asis values or wrap around. Checked before the loop so a rejected
+	// configuration leaves no partially populated router behind.
+	if len(rawUpstreams) > int(consts.DnsRequestOutboundIndex_UserDefinedMax) ||
+		len(rawUpstreams) > int(consts.DnsResponseOutboundIndex_UserDefinedMax) {
+		return fmt.Errorf("too many upstreams")
+	}
 	resolveIp46 := r.resolveBootstrap
 	if len(r.bootstrapDns) == 0 {
 		resolveIp46 = nil
@@ -322,7 +331,10 @@ func (r *Router) initUpstreams(rawUpstreams []config.KeyableString) error {
 	for _, upstreamRaw := range rawUpstreams {
 		tag, link := common.GetTagFromLinkLikePlaintext(string(upstreamRaw))
 		if tag == "" {
-			continue
+			// Mirror dns.New: an untagged upstream is a configuration error,
+			// and rejecting it keeps upstreamByIndex indices identical to the
+			// raw indices UpstreamName2Id hands to the matchers.
+			return fmt.Errorf("%w: '%v' has no tag", componentdns.ErrBadUpstreamFormat, upstreamRaw)
 		}
 		u, err := url.Parse(link)
 		if err != nil {
@@ -424,69 +436,52 @@ func compileMatcher[T any](
 }
 
 func compileSubscriptionPredicate(f *config_parser.Function) (func(subscriptionMeta) bool, error) {
-	conditions := make([]func(subscriptionMeta) bool, 0, 1)
-	if len(f.Params) == 0 {
-		conditions = append(conditions, func(subscriptionMeta) bool { return true })
-	}
-	groups, keyOrder, err := groupParamValuesByKey(f.Params)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse '%v': %w", f.String(false, false, false), err)
-	}
-	for _, key := range keyOrder {
-		values := groups[key]
-		condition, err := compileSubscriptionCondition(key, values)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse '%v': %w", f.String(false, false, false), err)
-		}
-		conditions = append(conditions, condition)
-	}
-	return wrapNotPredicate(conditions, f.Not), nil
+	return compileParamPredicate(f, compileSubscriptionCondition)
 }
 
 func compileNodePredicate(f *config_parser.Function) (func(NodeMeta) bool, error) {
-	conditions := make([]func(NodeMeta) bool, 0, 1)
-	if len(f.Params) == 0 {
-		conditions = append(conditions, func(NodeMeta) bool { return true })
-	}
-	groups, keyOrder, err := groupParamValuesByKey(f.Params)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse '%v': %w", f.String(false, false, false), err)
-	}
-	for _, key := range keyOrder {
-		values := groups[key]
-		condition, err := compileNodeCondition(key, values)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse '%v': %w", f.String(false, false, false), err)
-		}
-		conditions = append(conditions, condition)
-	}
-	return wrapNotPredicate(conditions, f.Not), nil
+	return compileParamPredicate(f, compileNodeCondition)
 }
 
 func compileSubNodePredicate(f *config_parser.Function) (func(NodeMeta) bool, error) {
-	conditions := make([]func(NodeMeta) bool, 0, 1)
-	if len(f.Params) == 0 {
-		conditions = append(conditions, func(meta NodeMeta) bool { return meta.SubscriptionTag != "" })
-	}
-	groups, keyOrder, err := groupParamValuesByKey(f.Params)
+	base, err := compileParamPredicate(f, compileSubNodeCondition)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse '%v': %w", f.String(false, false, false), err)
+		return nil, err
 	}
-	for _, key := range keyOrder {
-		values := groups[key]
-		condition, err := compileSubNodeCondition(key, values)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse '%v': %w", f.String(false, false, false), err)
-		}
-		conditions = append(conditions, condition)
-	}
-	base := wrapNotPredicate(conditions, f.Not)
 	return func(meta NodeMeta) bool {
 		if meta.SubscriptionTag == "" {
 			return false
 		}
 		return base(meta)
 	}, nil
+}
+
+// compileParamPredicate compiles the parameter list of a sub/node/subnode
+// selector function into a predicate: an empty parameter list compiles to an
+// always-true condition, keyed parameters are grouped and compiled through
+// compileCondition, and the conditions are OR-combined with the function's
+// `not` modifier applied by wrapNotPredicate.
+func compileParamPredicate[T any](
+	f *config_parser.Function,
+	compileCondition func(key string, values []string) (func(T) bool, error),
+) (func(T) bool, error) {
+	conditions := make([]func(T) bool, 0, 1)
+	if len(f.Params) == 0 {
+		conditions = append(conditions, func(T) bool { return true })
+	}
+	groups, keyOrder, err := groupParamValuesByKey(f.Params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse '%v': %w", f.String(false, false, false), err)
+	}
+	for _, key := range keyOrder {
+		values := groups[key]
+		condition, err := compileCondition(key, values)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse '%v': %w", f.String(false, false, false), err)
+		}
+		conditions = append(conditions, condition)
+	}
+	return wrapNotPredicate(conditions, f.Not), nil
 }
 
 func wrapNotPredicate[T any](conditions []func(T) bool, not bool) func(T) bool {
@@ -687,12 +682,10 @@ func (r *Router) resolveBootstrap(ctx context.Context, host string, network stri
 	return &netutils.Ip46{}, firstErr4, firstErr6
 }
 
-func (r *Router) lookupBootstrapIPAddr(ctx context.Context, network, host string) ([]net.IPAddr, error) {
-	if addr, err := netip.ParseAddr(host); err == nil {
-		return []net.IPAddr{{IP: net.IP(addr.AsSlice())}}, nil
-	}
-	dnsNetwork := common.MagicNetworkWithIPVersion("udp", r.soMark, r.mptcp, requestedIPVersion(network))
-	ip46, err4, err6 := r.resolveBootstrap(ctx, host, dnsNetwork)
+// ipAddrsFromIp46 projects a resolved answer onto the address family the dial
+// requested, preserving the resolver error precedence: a real answer wins, then
+// the A error, then the AAAA error, and finally the caller's no-address text.
+func ipAddrsFromIp46(ip46 *netutils.Ip46, err4, err6 error, network, noAddrErr string) ([]net.IPAddr, error) {
 	addrs := make([]net.IPAddr, 0, 2)
 	switch requestedIPVersion(network) {
 	case "4":
@@ -720,7 +713,176 @@ func (r *Router) lookupBootstrapIPAddr(ctx context.Context, network, host string
 	if err6 != nil {
 		return nil, err6
 	}
-	return nil, fmt.Errorf("bootstrap resolver returned no usable address for %q", host)
+	return nil, errors.New(noAddrErr)
+}
+
+func (r *Router) lookupBootstrapIPAddr(ctx context.Context, network, host string) ([]net.IPAddr, error) {
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return []net.IPAddr{{IP: net.IP(addr.AsSlice())}}, nil
+	}
+	// The bootstrap resolver is reached at a fixed address (119.29.29.29:53
+	// and 223.5.5.5:53 by default), so the family used to dial it follows
+	// from that address and must not be inherited from the caller. Passing
+	// the requested family here made both the A and the AAAA query dial a v4
+	// bootstrap literal over "udp6" whenever a v6-origin flow needed
+	// bootstrap resolution; that fails with "no suitable address found" and
+	// disabled bootstrap resolution entirely. Dial family-agnostically, the
+	// way the upstream queries in client.go already do. The requested family
+	// is still honoured when filtering the answers below.
+	dnsNetwork := common.MagicNetwork("udp", r.soMark, r.mptcp)
+	ip46, err4, err6 := r.resolveBootstrap(ctx, host, dnsNetwork)
+	return ipAddrsFromIp46(ip46, err4, err6, network, fmt.Sprintf("bootstrap resolver returned no usable address for %q", host))
+}
+
+// lookupSystemIPAddr resolves through this generation's direct DNS view: the
+// host resolver read from /etc/resolv.conf, or the configured fallback when
+// that file cannot supply a non-loopback server. The query carries the dae mark
+// so it leaves as direct traffic instead of being intercepted by dae's own DNS
+// ingress.
+func (r *Router) lookupSystemIPAddr(ctx context.Context, network, host string) ([]net.IPAddr, error) {
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return []net.IPAddr{{IP: net.IP(addr.AsSlice())}}, nil
+	}
+	if r.systemDNS == nil {
+		return nil, errNoSystemDNS
+	}
+	resolver, err := r.systemDNS.SystemDNS()
+	if err != nil {
+		return nil, fmt.Errorf("system resolver: %w", err)
+	}
+	if !resolver.IsValid() {
+		return nil, errNoSystemDNS
+	}
+	// The system resolver is a fixed address read from /etc/resolv.conf (or
+	// the configured fallback), so the family used to dial it follows from
+	// that address, exactly like the bootstrap resolver: inheriting the
+	// family requested by the caller would make a v6-origin flow dial a v4
+	// resolver literal over "udp6", fail with "no suitable address found",
+	// and take the whole system-DNS leg of the node-address race down. The
+	// requested family is still honoured when filtering the answers in
+	// ipAddrsFromIp46.
+	dnsNetwork := common.MagicNetwork("udp", r.soMark, r.mptcp)
+	ip46, err4, err6 := netutils.ResolveIp46(ctx, r.directDialer, resolver, host, dnsNetwork, false)
+	return ipAddrsFromIp46(ip46, err4, err6, network, fmt.Sprintf("system resolver %v returned no usable address for %q", resolver, host))
+}
+
+// ipLookupLeg is one named resolution attempt in a race. The name is kept so a
+// lookup can report which resolver answered.
+type ipLookupLeg struct {
+	name   string
+	lookup func(context.Context) ([]net.IPAddr, error)
+}
+
+// ipLookupLegTimeout bounds how long one leg of the race may run, so a
+// silently-dropping resolver cannot keep its leg alive until the caller's
+// context ends (the UDP resend loop re-sends forever). It reuses the shared
+// lookup budget (lookupSharedTimeout in client.go) and stays a variable only
+// so tests can shorten the wait.
+var ipLookupLegTimeout = lookupSharedTimeout
+
+// lookupNodeIPAddr resolves a node address that no node or subscription rule
+// selected an upstream for. The generation's direct DNS view and the configured
+// bootstrap resolvers are raced because either leg can be unreachable: a host
+// whose /etc/resolv.conf points at something unusable still reaches the
+// bootstrap resolvers, and a host whose bootstrap resolvers are blocked,
+// filtered, or only reachable over TCP still resolves through the system view.
+// The first leg that produces an address wins, so a generation without a system
+// DNS view keeps the previous bootstrap-only behaviour.
+func (r *Router) lookupNodeIPAddr(ctx context.Context, network, host string) ([]net.IPAddr, error) {
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return []net.IPAddr{{IP: net.IP(addr.AsSlice())}}, nil
+	}
+	legs := make([]ipLookupLeg, 0, 2)
+	if r.systemDNS != nil {
+		legs = append(legs, ipLookupLeg{name: "system", lookup: func(ctx context.Context) ([]net.IPAddr, error) {
+			return r.lookupSystemIPAddr(ctx, network, host)
+		}})
+	}
+	legs = append(legs, ipLookupLeg{name: "bootstrap", lookup: func(ctx context.Context) ([]net.IPAddr, error) {
+		return r.lookupBootstrapIPAddr(ctx, network, host)
+	}})
+	addrs, via, err := raceIPAddrLookups(ctx, host, legs)
+	if err != nil {
+		return nil, err
+	}
+	if r.log != nil {
+		r.log.Tracef("resolved node address %v via %s resolver: %v", host, via, addrs)
+	}
+	return addrs, nil
+}
+
+// raceIPAddrLookups returns the first usable answer among the legs and cancels
+// the rest. Each leg runs under its own deadline, so a blackholed resolver ends
+// its leg on time even when the caller set no deadline; the deadline derives
+// from the race's parent context, so a parent cancel or an earlier parent
+// deadline still wins. Every leg is canceled and awaited before the call
+// returns, so no leg keeps a lookup alive after the caller stops waiting, as
+// long as the dialer behind it honours context cancellation. When no leg
+// produces an address, the failures are joined in leg order, so the message and
+// the diagnosis it carries do not depend on which resolver answered first.
+func raceIPAddrLookups(ctx context.Context, host string, legs []ipLookupLeg) ([]net.IPAddr, string, error) {
+	raceCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type lookupResult struct {
+		leg   int
+		addrs []net.IPAddr
+		err   error
+	}
+	// Buffered so a losing leg can always publish its result and exit after the
+	// winner returns, instead of blocking on a receiver that already left.
+	results := make(chan lookupResult, len(legs))
+	var wg sync.WaitGroup
+	for i, leg := range legs {
+		wg.Add(1)
+		go func(i int, leg ipLookupLeg) {
+			defer wg.Done()
+			// Bound this leg by the shared lookup budget, derived from the
+			// race's parent context so the parent still decides first.
+			legCtx, cancelLeg := context.WithTimeout(raceCtx, ipLookupLegTimeout)
+			defer cancelLeg()
+			addrs, err := leg.lookup(legCtx)
+			if err != nil && raceCtx.Err() == nil && errors.Is(legCtx.Err(), context.DeadlineExceeded) {
+				// This leg's own bound fired while the caller still waits.
+				// Name the leg so a joined pair of timeouts says which
+				// resolver blackholed.
+				err = fmt.Errorf("%s leg timed out after %v: %w", leg.name, ipLookupLegTimeout, err)
+			}
+			results <- lookupResult{leg: i, addrs: addrs, err: err}
+		}(i, leg)
+	}
+
+	errs := make([]error, len(legs))
+	for range legs {
+		select {
+		case res := <-results:
+			if len(res.addrs) != 0 {
+				cancel()
+				wg.Wait()
+				return res.addrs, legs[res.leg].name, nil
+			}
+			errs[res.leg] = res.err
+		case <-ctx.Done():
+			cancel()
+			wg.Wait()
+			return nil, "", ctx.Err()
+		}
+	}
+	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		// The caller gave up; a leg's no-address text would hide that.
+		return nil, "", err
+	}
+	var firstErr error
+	for _, err := range errs {
+		if err != nil {
+			firstErr = errors.Join(firstErr, err)
+		}
+	}
+	if firstErr == nil {
+		firstErr = fmt.Errorf("no resolver returned a usable address for %q", host)
+	}
+	return nil, "", firstErr
 }
 
 func subscriptionHost(link string) string {
@@ -752,6 +914,9 @@ type resolvingDialer struct {
 }
 
 var errResolvingDialerRetired = errors.New("dns resolving dialer retired")
+
+// errNoSystemDNS reports a generation without a usable system DNS view.
+var errNoSystemDNS = errors.New("system DNS resolver is not configured")
 
 func newResolvingDialer(
 	base netproxy.Dialer,
@@ -796,19 +961,24 @@ func (d *resolvingDialer) lookupBaseIPAddr(ctx context.Context, network, host st
 	return net.DefaultResolver.LookupIPAddr(ctx, host)
 }
 
+// lookupControlIPAddr resolves the node address the wrapped dialer is bound to.
+// A node or subscription rule that selected an upstream keeps it; everything
+// else -- no matching rule, a rule that passes through, or an upstream that
+// returned no address -- is resolved by lookupNodeIPAddr, so the configured
+// bootstrap resolvers stop being the only way to reach a node.
 func (d *resolvingDialer) lookupControlIPAddr(ctx context.Context, router *Router, network, host string) ([]net.IPAddr, error) {
 	if d.controlUpstreamName == "" {
-		return router.lookupBootstrapIPAddr(ctx, network, host)
+		return router.lookupNodeIPAddr(ctx, network, host)
 	}
 	ips, err := router.LookupIPAddr(ctx, d.controlUpstreamName, network, host)
 	if errors.Is(err, errPassthroughToBaseResolver) {
-		return router.lookupBootstrapIPAddr(ctx, network, host)
+		return router.lookupNodeIPAddr(ctx, network, host)
 	}
 	if err != nil {
 		return nil, err
 	}
 	if len(ips) == 0 {
-		return router.lookupBootstrapIPAddr(ctx, network, host)
+		return router.lookupNodeIPAddr(ctx, network, host)
 	}
 	return ips, nil
 }

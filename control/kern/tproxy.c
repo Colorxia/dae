@@ -3,7 +3,13 @@
 
 // +build ignore
 
-// Disable implicit CO-RE from vmlinux.h to bypass bad relocation caused by GCC 15 DTE stripping UAPI structs.
+// Disable implicit CO-RE from vmlinux.h to bypass bad relocation.
+// Note: Previously misattributed to GCC 15 DTE. The actual root cause is that
+// pahole fails to parse DWARF5 debug info correctly, which strips UAPI structs
+// from the generated BTF.
+// Workaround for implicit CO-RE: compile kernel with CONFIG_DEBUG_INFO_DWARF4=y.
+// However, it is highly recommended to keep this macro defined, as it still
+// significantly improves overall compatibility across different environments.
 #define BPF_NO_PRESERVE_ACCESS_INDEX 1
 
 #include "headers/errno-base.h"
@@ -60,7 +66,7 @@
 #define MAX_INTERFACE_NUM 256
 #ifndef MAX_MATCH_SET_LEN
 #define MAX_MATCH_SET_LEN \
-	(32 * 32) // Should be sync with common/consts/ebpf_sync_spec.json.
+	(32 * 32) // Keep in sync with MaxMatchSetLen in common/consts/ebpf.go.
 #endif
 #define ROUTING_EPOCH_SLOT_NUM 2
 #define ROUTING_EPOCH_SLOT_UNKNOWN 0
@@ -68,8 +74,22 @@
 #define ROUTING_EPOCH_SLOT_RESULT_MASK 0x3
 #define MAX_LPM_SIZE 2048000
 #define MAX_LPM_NUM (ROUTING_EPOCH_SLOT_NUM * MAX_MATCH_SET_LEN + 8)
-#define MAX_CONN_STATE_NUM (65536 * 4)
-#define MAX_REDIRECT_TRACK_NUM 65536
+// Sizing of the BPF_F_NO_PREALLOC hash maps below follows the measured cost
+// model: the kernel charges max_entries * 16 B for the bucket array at load
+// time regardless of use, while live entries cost ~145 B each on top. Sized
+// against a home/SMB gateway workload (concurrent live entries measured over
+// hours: conn_state ~10^2, redirect_track ~10^2, routing_handoff ~10^1,
+// cookie_pid ~10^1, domain_routing ~0), with >=250x headroom kept on every
+// map. A full map never drops traffic: conn_state and redirect_track count the
+// rejection in bpf_stats_map (userspace reports it, and conn_state overflow
+// also drives janitor pressure mode), while routing_handoff and cookie_pid
+// fall back to their slow path with no counter of their own, so for those two
+// the janitor's >90% capacity warning is the only signal that the map is too
+// small. The macros below are the clang-side defaults: at load, userspace sets
+// conn_state_map from bpf_conn_state_map_size, and a same-port reload keeps
+// the inherited live map, so the runtime capacity need not match the macro.
+#define MAX_CONN_STATE_NUM 65536
+#define MAX_REDIRECT_TRACK_NUM 16384
 // A reply binding (redirect_track entry) may only be rebound by a different
 // publisher (interface/MAC) once it has been silent for this long. The window
 // must be long enough that a roaming LAN client's gap (Wi-Fi roam, VM
@@ -77,9 +97,9 @@
 // writer cannot hand a live flow's reply path to itself. Userspace injects
 // EVENT_RATE.redirect_rebind_stale_ns; this is the clang-side fallback.
 #define REDIRECT_REBIND_STALE_NS_FALLBACK 2000000000ULL
-#define MAX_ROUTING_HANDOFF_NUM 65536
-#define MAX_COOKIE_PID_PNAME_MAPPING_NUM 65536
-#define MAX_DOMAIN_ROUTING_NUM 65536
+#define MAX_ROUTING_HANDOFF_NUM 16384
+#define MAX_COOKIE_PID_PNAME_MAPPING_NUM 16384
+#define MAX_DOMAIN_ROUTING_NUM 8192
 // MAX_TCP_OFFLOAD_NUM bounds concurrent TCP relay offload sessions. Each
 // session occupies two fast_sock entries (one per direction).
 #define MAX_TCP_OFFLOAD_NUM 16384
@@ -464,6 +484,35 @@ static __always_inline bool bpf_sock_is_dae_socket(const struct bpf_sock *sk)
 	struct bpf_sock *fullsock = bpf_sk_fullsock((struct bpf_sock *)sk);
 
 	return fullsock && fullsock->mark == PARAM.dae_socket_mark;
+}
+
+/* Whether the matched host socket is bound to the packet's exact destination
+ * address. A wildcard-bound socket (bound address zero) answers for every
+ * destination, so its presence says nothing about whether the packet was
+ * addressed to this host; only an exact match is proof that the packet is
+ * addressed to a service this host runs. */
+static __always_inline bool
+sock_bound_to_daddr(const struct bpf_sock *sk, const struct tuples *tuples,
+		    __be16 h_proto)
+{
+	if (h_proto == bpf_htons(ETH_P_IP)) {
+		__u32 bound = sk->src_ip4; // inet_rcv_saddr, 0 == wildcard
+
+		return bound != 0 && bound == tuples->five.dip.u6_addr32[3];
+	}
+
+	if (h_proto == bpf_htons(ETH_P_IPV6)) {
+		const __u32 *bound = sk->src_ip6;
+		bool wildcard = !(bound[0] | bound[1] | bound[2] | bound[3]);
+
+		return !wildcard &&
+		       bound[0] == tuples->five.dip.u6_addr32[0] &&
+		       bound[1] == tuples->five.dip.u6_addr32[1] &&
+		       bound[2] == tuples->five.dip.u6_addr32[2] &&
+		       bound[3] == tuples->five.dip.u6_addr32[3];
+	}
+
+	return false;
 }
 
 struct conn_state {
@@ -2976,11 +3025,14 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 			  (__u32)pkt->ethh.h_source[5]),
 	};
 
-	// Socket lookup before routing to detect local services (NAT loopback).
-	// UDP only: any matching socket indicates a local service. TCP is not
-	// looked up here because every non-SYN TCP packet already returned above,
-	// so only SYNs reach this point and a SYN must go through routing.
-	if (pkt->l4proto == IPPROTO_UDP) {
+	// Socket lookup before routing to detect a service on this host that the
+	// packet is addressed to (NAT loopback). Only a socket bound to the
+	// packet's exact destination address proves that: a wildcard-bound socket
+	// answers for any destination, so it must not capture traffic addressed
+	// elsewhere, and it must never capture DNS. TCP is not looked up here
+	// because every non-SYN TCP packet already returned above.
+	if (pkt->l4proto == IPPROTO_UDP &&
+	    pkt->tuples.five.dport != bpf_htons(53)) {
 		struct bpf_sock_tuple tuple = { 0 };
 		__u32 tuple_size;
 		struct bpf_sock *sk;
@@ -3011,10 +3063,12 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 		sk = bpf_sk_lookup_udp(skb, &tuple, tuple_size,
 				       (__u64)(s32)-1, 0);
 		if (sk) {
-			if (!bpf_sock_is_dae_socket(sk)) {
+			if (!bpf_sock_is_dae_socket(sk) &&
+			    sock_bound_to_daddr(sk, &pkt->tuples,
+						pkt->ethh.h_proto)) {
 				bpf_sk_release(sk);
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
-				bpf_printk("udp(lan): local socket found, pass through");
+				bpf_printk("udp(lan): local socket bound to the destination, pass through");
 #endif
 				return TC_ACT_OK;
 			}
@@ -3251,10 +3305,10 @@ tproxy_wan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 
 		copy_reversed_tuples(&pkt->tuples.five, &reversed_tuples_key);
 		/* Observability only: an unsolicited WAN-ingress UDP flow would
-		 * otherwise create conn_state from the outside (262144 entries
-		 * over a 300s TTL is only ~874 new flows per second). Rejecting
-		 * it would also drop the is_wan_ingress_direction marker that the
-		 * wan_egress pass-through depends on (host-terminated UDP
+		 * otherwise create conn_state from the outside (MAX_CONN_STATE_NUM
+		 * entries over a 300s TTL is only ~218 new flows per second).
+		 * Rejecting it would also drop the is_wan_ingress_direction marker
+		 * that the wan_egress pass-through depends on (host-terminated UDP
 		 * services), so this is counted, not enforced. See fix-plan.md
 		 * decision A20. */
 		mark_udp_seen_with_status(&reversed_tuples_key, true,
@@ -3948,6 +4002,19 @@ load_redirect_tuple(struct __sk_buff *skb,
  * applies (publish_redirect_track_for_packet compares ifindex / from_wan /
  * smac); the reply path has no forward ifindex to compare against, because
  * every reply arrives on the same dae0 ingress hook.
+ *
+ * Known limitation (audited 2026-10): in the production netns topology this
+ * match can never succeed. Replies leave the dae namespace through the
+ * dae0peer default route, so their L2 header always carries the veth pair's
+ * macs (h_source = dae0peer, h_dest = dae0), never the stored LAN/WAN
+ * publisher macs. The refresh below is therefore dead code in production and
+ * the binding's lease is sustained solely by the forward path refresh plus
+ * the userspace session pins. The unit test only passes because it crafts
+ * reply frames carrying the winner's macs by hand. Making the reply-side
+ * refresh work requires a session-identity channel the skb does not carry:
+ * every netns reply shares the veth macs, so matching on them would let a
+ * rejected competitor's replies refresh the winner's binding again (the
+ * P1-8 takeover freeze this test exists to prevent).
  *
  * An unreadable L2 header is reported as "not the publisher" on purpose: the
  * conservative failure of this test is to stop refreshing the entry, which

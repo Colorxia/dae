@@ -7,14 +7,14 @@ require (
 	github.com/antlr/antlr4/runtime/Go/antlr/v4 v4.0.0-20230305170008-8188dc5388df
 	github.com/cilium/ebpf v0.22.0
 	github.com/daeuniverse/dae-config-dist/go/dae_config v0.0.0-20230604120805-1c27619b592d
-	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260911162531-896954f65c52
+	github.com/daeuniverse/outbound v0.0.0-20261008000641-93226e08de54
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mholt/archives v0.1.5
 	github.com/miekg/dns v1.1.72
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac
-	github.com/olicesx/quic-go v0.0.0-20260910141758-62d80bbebb5b
+	github.com/olicesx/quic-go v0.0.0-20261007104854-44a1f9eb14fe
 	github.com/panjf2000/ants/v2 v2.11.5
 	github.com/safchain/ethtool v0.7.0
 	github.com/shirou/gopsutil/v4 v4.26.1
@@ -47,6 +47,7 @@ require (
 	github.com/bodgit/windows v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
+	github.com/dgryski/go-metro v0.0.0-20200812162917-85c65e2d0165 // indirect
 	github.com/dgryski/go-rc2 v0.0.0-20150621095337-8a9021637152 // indirect
 	github.com/dsnet/compress v0.0.2-0.20230904184137-39efe44ab707 // indirect
 	github.com/ebitengine/purego v0.9.1 // indirect
@@ -71,6 +72,7 @@ require (
 	github.com/sagernet/sing-shadowtls v0.2.0 // indirect
 	github.com/samber/lo v1.52.0 // indirect
 	github.com/samber/oops v1.21.0 // indirect
+	github.com/seiflotfy/cuckoofilter v0.0.0-20220411075957-e3b120b3f5fb // indirect
 	github.com/sorairolake/lzip-go v0.3.8 // indirect
 	github.com/spf13/afero v1.15.0 // indirect
 	github.com/ulikunitz/xz v0.5.15 // indirect
@@ -89,7 +91,6 @@ require (
 require (
 	github.com/dgryski/go-camellia v0.0.0-20191119043421-69a8a13fb23d // indirect
 	github.com/dgryski/go-idea v0.0.0-20170306091226-d2fb45a411fb // indirect
-	github.com/dgryski/go-metro v0.0.0-20250106013310-edb8663e5e33 // indirect
 	github.com/dlclark/regexp2 v1.11.5
 	github.com/eknkc/basex v1.0.1 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
@@ -103,7 +104,6 @@ require (
 	github.com/mzz2017/disk-bloom v1.0.1 // indirect
 	github.com/onsi/ginkgo v1.16.5 // indirect
 	github.com/refraction-networking/utls v1.8.2 // indirect
-	github.com/seiflotfy/cuckoofilter v0.0.0-20240715131351-a2f2c23f1771 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	gitlab.com/yawning/chacha20.git v0.0.0-20230427033715-7877545b1b37 // indirect
 	golang.org/x/term v0.40.0 // indirect
@@ -115,7 +115,12 @@ require (
 // control, and explicit-transport address behavior. Performance and security
 // claims are enforced in the fork's own unit/race gates; no GC behavior is
 // inferred from pool implementation choice here.
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260910141758-62d80bbebb5b
+// The pinned revision also removes the last per-packet receive-path
+// allocations: the packet-number scratch is a per-call stack array, the
+// frame sorter's reorder map grows lazily instead of reserving 64 slots
+// (~6.4 KiB per stream and per crypto stream on every connection), and PING
+// frames share one stateless instance.
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20261007104854-44a1f9eb14fe
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
@@ -132,4 +137,42 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260910
 // and hy2 defaults to bbr3 again. TLS records are coalesced into one socket
 // write per burst across anytls and the shared tls/ws transports (-35% to
 // -52% write syscalls measured on trojan and trojan-wss relay paths).
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260925082016-04be789bbeeb
+// This pin adds the typed datagram-dropped read contract
+// (netproxy.ErrDatagramDropped unwrapping to io.ErrShortBuffer) across
+// the packet read paths, a reflection-driven wrapper capability parity
+// gate, and converts silently-truncating readers (trojanc/juicity/tuic)
+// to typed drops; dae classifies these as per-datagram events instead
+// of retiring forwarders or reporting dialers unavailable.
+// It also fixes the vision UDP buffer arithmetic: the frame-length check
+// cast len(p) to uint16, so a 65536-byte read buffer (dae's full-range DNS
+// forward buffer, and the pool's largest bucket) wrapped to 0 and dropped
+// every datagram on xudp XTLS/Vision nodes.
+// The vmess packetaddr reader now reads straight into the caller's buffer
+// instead of a MaxUDPSize (2048) staging pool, so a reply larger than 2048
+// bytes is delivered rather than reported as a short-buffer drop; oversized
+// datagrams still surface the typed drop instead of being split.
+// This pin stops holding the bounded resolved-target cache lock across the
+// dial-target resolution (one slow FullCone peer no longer stalls writes to
+// every other peer) and releases the REALITY spider path-map lock on the
+// panic path.
+// It also walks the vmess KDF hmac tree without per-node allocations (and
+// routes an over-budget path element to the reference construction instead
+// of slicing past the fixed scratch), drops the FNV hasher pool that only
+// added a sync.Pool round trip, gates per-dial sticky-IP debug logging
+// behind IsLevelEnabled, and moves the 32 KiB per-session netproxy read
+// buffer to the shared pool: the array goes back when the session's read
+// loop ends (a terminal read error, or an idle Close), so dae stops paying
+// one 32 KiB zeroed allocation per proxied raw-TCP session.
+// The current pin advances quic-go to the revision that removes the last
+// per-packet receive-path allocations (per-call stack packet-number scratch,
+// lazily grown frame-sorter reorder map, one shared stateless PING frame) and
+// keeps the tuic auth FIN best effort when the peer stops reading the
+// one-shot Authenticate stream: a server that cancels that stream once it has
+// consumed the command (sing-quic does, and the fork's e2e server mirrors it)
+// made quic-go refuse the FIN, so the dial failed whenever the peer's
+// STOP_SENDING won the race against the client's Close. That is a legal peer
+// ordering, not an authentication result - a rejecting server closes the
+// connection with an auth error - and the reference client discards the same
+// Close error.
+
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-20261008000641-93226e08de54

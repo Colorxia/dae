@@ -881,7 +881,7 @@ func baseReloadDatapathConfig() *config.Config {
 			TproxyPort:            12345,
 			LanInterface:          []string{"eth0"},
 			WanInterface:          []string{"wan0"},
-			BpfConnStateMapSize:   262144,
+			BpfConnStateMapSize:   65536,
 			SoMarkFromDae:         0x8000000,
 			SoMarkFromDaeSet:      true,
 			FallbackResolver:      "8.8.8.8:53",
@@ -1436,8 +1436,8 @@ func TestWaitForControlPlaneDrainReturnsTimeout(t *testing.T) {
 }
 
 // retirementBehaviorPlane extends fakeRetirementControlPlane with abort
-// tracking to prove the three-way retirement precedence rule:
-// abort → !overlap → drain.
+// tracking to prove the two-stage retirement precedence rule:
+// abort → drain.
 type retirementBehaviorPlane struct {
 	*fakeRetirementControlPlane
 	abortCalled         atomic.Bool

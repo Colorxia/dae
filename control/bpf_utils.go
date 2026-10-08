@@ -119,47 +119,33 @@ func cidrToBpfLpmKey(prefix netip.Prefix) _bpfLpmKey {
 }
 
 var (
-	CheckBatchUpdateFeatureOnce sync.Once
-	SimulateBatchUpdate         bool
-	SimulateBatchUpdateLpmTrie  bool
+	checkBatchUpdateFeatureOnce sync.Once
+	simulateBatchUpdate         bool
+	simulateBatchUpdateLpmTrie  bool
 
-	CheckBatchDeleteFeatureOnce sync.Once
-	SimulateBatchDelete         bool
+	checkBatchDeleteFeatureOnce sync.Once
+	simulateBatchDelete         bool
 )
 
-func initBatchDeleteFeatureFlags() {
-	CheckBatchDeleteFeatureOnce.Do(func() {
-		version, e := internal.KernelVersion()
-		if e != nil {
-			SimulateBatchDelete = true
-			return
-		}
-		// BatchDelete requires kernel 5.6+ for BPF_MAP_TYPE_BATCH operations.
-		if version.Less(consts.UserspaceBatchUpdateFeatureVersion) {
-			SimulateBatchDelete = true
-		}
-	})
-}
-
 func BpfMapBatchUpdate(m *ebpf.Map, keys any, values any, opts *ebpf.BatchOptions) (n int, err error) {
-	CheckBatchUpdateFeatureOnce.Do(func() {
+	checkBatchUpdateFeatureOnce.Do(func() {
 		version, e := internal.KernelVersion()
 		if e != nil {
-			SimulateBatchUpdate = true
-			SimulateBatchUpdateLpmTrie = true
+			simulateBatchUpdate = true
+			simulateBatchUpdateLpmTrie = true
 			return
 		}
 		if version.Less(consts.UserspaceBatchUpdateFeatureVersion) {
-			SimulateBatchUpdate = true
+			simulateBatchUpdate = true
 		}
 		if version.Less(consts.UserspaceBatchUpdateLpmTrieFeatureVersion) {
-			SimulateBatchUpdateLpmTrie = true
+			simulateBatchUpdateLpmTrie = true
 		}
 	})
 
-	simulate := SimulateBatchUpdate
+	simulate := simulateBatchUpdate
 	if m.Type() == ebpf.LPMTrie {
-		simulate = SimulateBatchUpdateLpmTrie
+		simulate = simulateBatchUpdateLpmTrie
 	}
 
 	if !simulate {
@@ -196,14 +182,24 @@ func BpfMapBatchUpdate(m *ebpf.Map, keys any, values any, opts *ebpf.BatchOption
 // missing key, so ENOENT must resume at the following key instead of being
 // treated as success for the unprocessed suffix.
 func BpfMapBatchDelete(m *ebpf.Map, keys any) (n int, err error) {
-	initBatchDeleteFeatureFlags()
+	checkBatchDeleteFeatureOnce.Do(func() {
+		version, e := internal.KernelVersion()
+		if e != nil {
+			simulateBatchDelete = true
+			return
+		}
+		// BatchDelete requires kernel 5.6+ for BPF_MAP_TYPE_BATCH operations.
+		if version.Less(consts.UserspaceBatchUpdateFeatureVersion) {
+			simulateBatchDelete = true
+		}
+	})
 
 	vKeys := reflect.ValueOf(keys)
 	if vKeys.Kind() != reflect.Slice {
 		return 0, fmt.Errorf("keys must be slice")
 	}
 
-	if !SimulateBatchDelete {
+	if !simulateBatchDelete {
 		n, err = batchDeleteIgnoringMissing(vKeys, func(suffix any) (int, error) {
 			return m.BatchDelete(suffix, &ebpf.BatchOptions{})
 		})
@@ -258,13 +254,35 @@ func batchDeleteIgnoringMissing(vKeys reflect.Value, deleteBatch func(keys any) 
 	return deleted, nil
 }
 
-var detectCgroupPathCached = sync.OnceValues(scanCgroupPath)
+// detectCgroupPathMu guards the success-only probe cache below. A failure is
+// never cached: a transient scan failure (EMFILE, or a container that mounts
+// cgroup2 slightly after dae starts) must recover at the next reload instead
+// of freezing "cgroup2 is not enabled" for the life of the process.
+var (
+	detectCgroupPathMu    sync.Mutex
+	detectCgroupPathValue string
+	detectCgroupPathFound bool
+
+	// scanCgroupPathFn is the test seam over the real /proc/mounts scan.
+	scanCgroupPathFn = scanCgroupPath
+)
 
 // detectCgroupPath returns the first-found mount point of type cgroup2,
-// caching the result for the lifetime of the process to avoid repeatedly
-// scanning /proc/mounts on reloads or multiple setups.
+// caching a successful result for the lifetime of the process to avoid
+// repeatedly scanning /proc/mounts on reloads or multiple setups. A failed
+// scan is retried on the next call.
 func detectCgroupPath() (string, error) {
-	return detectCgroupPathCached()
+	detectCgroupPathMu.Lock()
+	defer detectCgroupPathMu.Unlock()
+	if detectCgroupPathFound {
+		return detectCgroupPathValue, nil
+	}
+	path, err := scanCgroupPathFn()
+	if err != nil {
+		return "", err
+	}
+	detectCgroupPathValue, detectCgroupPathFound = path, true
+	return path, nil
 }
 
 func scanCgroupPath() (string, error) {
@@ -318,15 +336,19 @@ type loadBpfOptions struct {
 }
 
 const (
-	defaultConnStateMapMaxEntries = 65536 * 4
+	defaultConnStateMapMaxEntries = 65536
 	// defaultRedirectTrackMapMaxEntries mirrors MAX_REDIRECT_TRACK_NUM in
 	// kern/tproxy.c and is cross-checked against the compiled map capacity by
-	// tuneRedirectTrackMap. The C default is deliberately kept: raising it to
-	// 262144 must be justified by measuring resident memory first (HASH
-	// without preallocation only preallocates the bucket array, so the cost
-	// is dominated by live entries: roughly 24 B value + 48 B key + element
-	// overhead per entry), see the D4 report.
-	defaultRedirectTrackMapMaxEntries = 65536
+	// tuneRedirectTrackMap. Sizing follows the measured cost model: a
+	// BPF_F_NO_PREALLOC hash is charged max_entries * 16 B for the bucket
+	// array at load time regardless of use (live entries add ~145 B each), so
+	// the old "cost is dominated by live entries" rationale from the D4
+	// report only holds for small capacities. A 2026-10-07 resident-memory
+	// audit on a home gateway measured ~63 live redirect_track entries and a
+	// 1 MiB bucket floor at 65536 slots; 16384 keeps 250x headroom while
+	// freeing most of that floor. Map-full degrades to the slow path and is
+	// counted in bpf_stats_map for userspace overflow reporting.
+	defaultRedirectTrackMapMaxEntries = 16384
 )
 
 // The blocked-event rate-limit contract values (blockedEventRateKey,
