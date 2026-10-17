@@ -192,9 +192,11 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 	// DNS is a stateless protocol and doesn't need the connection tracking
 	// features that TCP relay provides. This optimization handles DNS queries
 	// directly through the DNS controller.
+	// A must_rules verdict skips the fast path: the flow is forwarded as plain
+	// TCP for the routing result's outbound instead.
 	// Uses bufio.Reader to peek at data without consuming it,
 	// allowing proper fallback if this isn't DNS traffic.
-	if dst.Port() == 53 {
+	if dst.Port() == 53 && dnsFastPathPermitted(routingResult) {
 		bufReader := bufio.NewReader(lConn)
 		handled, dnsErr := c.handleTCPDnsFastPathOwned(ctx, lConn, bufReader, src, dst, routingResult, ownership)
 		if handled {
@@ -208,63 +210,77 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 
 	var (
 		domain     string
+		sniffProto sniffing.SniffProtocol
 		lRelayConn netproxy.Conn = lConn
 	)
 	if c.shouldTryTcpSniff(dst, routingResult) {
-		cacheKey := newTcpSniffNegKey(dst, routingResult)
 		now := time.Now()
-		if c.shouldSkipTcpSniffByNegativeCache(cacheKey, now) {
-			if c.log.IsLevelEnabled(logrus.TraceLevel) {
-				c.log.WithFields(logrus.Fields{
-					"src": src.String(),
-					"dst": dst.String(),
-				}).Trace("Skip TCP sniffing by negative cache")
-			}
+		if consultDomain, ok := c.SniConsultDomain(routingResult, src, dst, now); ok {
+			// P2 consult adoption: a single fresh owner covers this IP and
+			// the terminal-outbound preview passed, so the cached domain
+			// stands in for the sniff. No prefetch and no sniffer wrapper:
+			// the relay reads lConn directly, exactly like a non-sniffed
+			// connection. TTL is deliberately not refreshed here; the
+			// sampling miss in the consult re-pays the real sniff.
+			domain = consultDomain
 		} else {
-			probeConn, prefetched, ready, probeErr := prefetchForTcpSniff(lConn, c.sniffingTimeout, tcpSniffPrefetchBytes)
-			if probeErr != nil {
-				return probeErr
-			}
-			switch {
-			case !ready:
-				// No early payload; treat as non-sniffable to avoid stalling server-first/established flows.
-				c.noteTcpSniffFailure(cacheKey, now)
-				lRelayConn = probeConn
-			case !isLikelyHttpOrTLSPrefix(prefetched):
-				// Fast reject for non HTTP/TLS prefixes.
-				c.noteTcpSniffFailure(cacheKey, now)
-				lRelayConn = probeConn
-			default:
-				// ConnSniffer should be used later, so we cannot close it now.
-				sniffer := sniffing.NewConnSniffer(probeConn, c.sniffingTimeout, c.log)
-				defer func() { _ = sniffer.Close() }()
-				lRelayConn = sniffer
-
-				domain, err = sniffer.SniffTcp()
-				if err != nil {
-					// Best practice:
-					// 1) Sniffing-domain errors (not applicable/need more/not found) should not break relay.
-					// 2) Ignorable connection errors (EOF/reset/timeout) should not break relay.
-					// 3) Other unexpected errors should fail fast instead of being silently hidden.
-					if !sniffing.IsSniffingError(err) && !daerrors.IsIgnorableConnectionError(err) {
-						return err
-					}
-					if !sniffing.IsSniffingError(err) {
-						if c.log.IsLevelEnabled(logrus.DebugLevel) {
-							c.log.WithError(err).WithFields(logrus.Fields{
-								"src": src.String(),
-								"dst": dst.String(),
-							}).Debug("TCP sniffing encountered ignorable connection error; continue relay")
-						}
-					}
-					// After repeated misses, temporarily suppress sniff attempts for the
-					// same flow signature so transient or unsupported traffic does not
-					// repeatedly pay the full sniffing cost.
+			cacheKey := newTcpSniffNegKey(dst, routingResult)
+			if c.shouldSkipTcpSniffByNegativeCache(cacheKey, now) {
+				if c.log.IsLevelEnabled(logrus.TraceLevel) {
+					c.log.WithFields(logrus.Fields{
+						"src": src.String(),
+						"dst": dst.String(),
+					}).Trace("Skip TCP sniffing by negative cache")
+				}
+			} else {
+				probeConn, prefetched, ready, probeErr := prefetchForTcpSniff(lConn, c.sniffingTimeout, tcpSniffPrefetchBytes)
+				if probeErr != nil {
+					return probeErr
+				}
+				switch {
+				case !ready:
+					// No early payload; treat as non-sniffable to avoid stalling server-first/established flows.
 					c.noteTcpSniffFailure(cacheKey, now)
-					domain = ""
-				} else {
-					// Any success means this flow signature is sniffable; clear suppression.
-					c.clearTcpSniffNegative(cacheKey)
+					lRelayConn = probeConn
+				case !isLikelyHttpOrTLSPrefix(prefetched):
+					// Fast reject for non HTTP/TLS prefixes.
+					c.noteTcpSniffFailure(cacheKey, now)
+					lRelayConn = probeConn
+				default:
+					// ConnSniffer should be used later, so we cannot close it now.
+					sniffer := sniffing.NewConnSniffer(probeConn, c.sniffingTimeout, c.log)
+					defer func() { _ = sniffer.Close() }()
+					lRelayConn = sniffer
+
+					domain, sniffProto, err = sniffer.SniffTcp()
+					if err != nil {
+						// Best practice:
+						// 1) Sniffing-domain errors (not applicable/need more/not found) should not break relay.
+						// 2) Ignorable connection errors (EOF/reset/timeout) should not break relay.
+						// 3) Other unexpected errors should fail fast instead of being silently hidden.
+						if !sniffing.IsSniffingError(err) && !daerrors.IsIgnorableConnectionError(err) {
+							return err
+						}
+						if !sniffing.IsSniffingError(err) {
+							if c.log.IsLevelEnabled(logrus.DebugLevel) {
+								c.log.WithError(err).WithFields(logrus.Fields{
+									"src": src.String(),
+									"dst": dst.String(),
+								}).Debug("TCP sniffing encountered ignorable connection error; continue relay")
+							}
+						}
+						// After repeated misses, temporarily suppress sniff attempts for the
+						// same flow signature so transient or unsupported traffic does not
+						// repeatedly pay the full sniffing cost.
+						c.noteTcpSniffFailure(cacheKey, now)
+						domain = ""
+					} else {
+						// Any success means this flow signature is sniffable; clear suppression.
+						c.clearTcpSniffNegative(cacheKey)
+						// Learn TLS sniffed domains into the kernel routing
+						// fallback (nil-safe when SNI learning is disabled).
+						c.sniLearning.LearnSniffed(dst.Addr(), domain, sniffProto)
+					}
 				}
 			}
 		}

@@ -109,6 +109,9 @@ type ControlPlane struct {
 	mptcp                  bool
 	udpRouteScopeSensitive bool
 	controlPlaneUDPRuntime
+	// sniLearning projects sniffed TLS SNI knowledge into the kernel routing
+	// fallback map. Nil-safe: disabled configurations keep a nil subsystem.
+	sniLearning *sniLearning
 	// Rate limits for the per-connection/per-packet log conditions that used
 	// to carry their own hand-rolled CAS loops; pacedAlert keeps the same
 	// first-line-always-logs, then one line per cooldown, semantics.
@@ -644,6 +647,11 @@ func NewControlPlaneWithContextOptions(
 	if dialMode == consts.DialMode_Ip {
 		sniffingTimeout = 0
 	}
+	if global.SniLearning {
+		if err := ValidateSniLearningTtl(global.SniLearningTtl); err != nil {
+			return nil, fmt.Errorf("invalid global.sni_learning_ttl: %w", err)
+		}
+	}
 	disableKernelAliveCallback := dialMode != consts.DialMode_Ip
 	_direct, directProperty := dialer.NewDirectDialer(option, true)
 	direct := dialer.NewDialerContext(context.Background(), _direct, option, dialer.InstanceOption{DisableCheck: true}, directProperty)
@@ -810,6 +818,10 @@ func NewControlPlaneWithContextOptions(
 	if err != nil {
 		return nil, fmt.Errorf("RoutingMatcherBuilder.BuildUserspace: %w", err)
 	}
+	sniLearning := newSniLearning(core, routingMatcher, log, global, sniffingTimeout, dialMode, uint64(policyIdentity.Epoch()))
+	if sniLearning != nil {
+		log.Infoln("SNI learning enabled: sniffed TLS domains will project into the kernel routing fallback") //nolint:lll
+	}
 
 	// Get referenced outbounds to limit health checks.
 	referencedOutbounds := builder.GetReferencedOutbounds()
@@ -893,6 +905,7 @@ func NewControlPlaneWithContextOptions(
 		lanInterface:                  global.LanInterface,
 		wanInterface:                  global.WanInterface,
 		sniffingTimeout:               sniffingTimeout,
+		sniLearning:                   sniLearning,
 		tproxyPortProtect:             global.TproxyPortProtect,
 		soMarkFromDae:                 global.SoMarkFromDae,
 		mptcp:                         global.Mptcp,
@@ -1028,6 +1041,40 @@ func clearReloadDomainRoutingMapSlot(bpf *bpfObjects, slot uint32) error {
 	}
 	if _, err := BpfMapBatchDelete(bpf.DomainRoutingMap, keys); err != nil {
 		return fmt.Errorf("clear domain routing slot %d: %w", slot, err)
+	}
+	return nil
+}
+
+// clearReloadSniRoutingMapSlot clears one routing epoch slot of the SNI
+// learning fallback map. Runs at the same orchestration points as
+// clearReloadDomainRoutingMapSlot and under the same projection mutex.
+func clearReloadSniRoutingMapSlot(bpf *bpfObjects, slot uint32) error {
+	if bpf == nil || bpf.SniRoutingMap == nil {
+		return nil
+	}
+	if !validRoutingEpochSlot(slot) {
+		return fmt.Errorf("invalid SNI routing epoch slot %d", slot)
+	}
+
+	var (
+		key   bpfRoutingEpochIp
+		value bpfDomainRouting
+		keys  []bpfRoutingEpochIp
+		iter  = bpf.SniRoutingMap.Iterate()
+	)
+	for iter.Next(&key, &value) {
+		if key.Slot == slot {
+			keys = append(keys, key)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("iterate SNI routing slot %d: %w", slot, err)
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	if _, err := BpfMapBatchDelete(bpf.SniRoutingMap, keys); err != nil {
+		return fmt.Errorf("clear SNI routing slot %d: %w", slot, err)
 	}
 	return nil
 }
@@ -1295,15 +1342,12 @@ func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 				return
 			}
 			c.penalizeDnsDialArg(dialArgument, time.Now())
-			if dialArgument == nil || dialArgument.l4proto == consts.L4ProtoStr_UDP {
-				return
-			}
-			dialArgument.bestDialer.ReportUnavailable(&dialer.NetworkType{
-				L4Proto:         dialArgument.l4proto,
-				IpVersion:       dialArgument.ipversion,
-				IsDns:           true,
-				UdpHealthDomain: dialer.UdpHealthDomainDns,
-			}, err)
+			// The TCP-leg availability report that used to live here is
+			// subsumed by the leg-agnostic DNS transactional evidence in
+			// DnsController.reportDnsForwardFailure: it fed the shared
+			// traffic-failure threshold (50 consecutive), which an
+			// interleaved degradation never reached, and it bypassed the
+			// evidence ring entirely.
 		},
 		FixedDomainTtl:          c.dnsFixedDomainTtl,
 		OptimisticCache:         c.dnsOptimisticCache,
@@ -1427,6 +1471,20 @@ func chooseDnsDialerCandidate(preferred, penalized *dnsDialerCandidate) (*dnsDia
 		return penalized, true
 	}
 	return nil, false
+}
+
+// chooseGatedDnsDialerCandidate ranks the chooser's candidate pools: a
+// DNS-evidence-gated candidate first, then a gated-but-penalized one (a
+// recent timeout on a node whose DNS domain is healthy says less than a
+// convicted ring), and only then the best ungated candidate. The ungated
+// fallback keeps a fleet-wide DNS-domain outage (e.g. the udp_check_dns
+// target itself unreachable) from turning into "no proper dialer for DNS
+// upstream": the evidence gate is a preference, not a hard requirement.
+func chooseGatedDnsDialerCandidate(gated, gatedPenalized, ungated *dnsDialerCandidate) (*dnsDialerCandidate, bool) {
+	if cand, penalized := chooseDnsDialerCandidate(gated, gatedPenalized); cand != nil {
+		return cand, penalized
+	}
+	return ungated, false
 }
 
 func buildDnsDialerSnapshotKeyForSnapshot(snapshot DnsRequestSnapshot, upstream *dns.Upstream) (dnsDialerSnapshotKey, bool) {
@@ -2499,6 +2557,8 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 	if err := validateListener(listener); err != nil {
 		return err
 	}
+	// SNI learning worker is nil-safe; disabled planes start nothing.
+	go c.sniLearning.serve(c.ctx)
 	publishListenerSockets := c.publishListenerSockets
 	publishBeforeCommit := c.preparedDatapathCommit && !c.sharedBpfReload && c.core != nil
 	if publishBeforeCommit {
@@ -2822,6 +2882,7 @@ func (c *ControlPlane) chooseBestDnsDialerSnapshot(
 	var (
 		bestCandidate          *dnsDialerCandidate
 		bestPenalizedCandidate *dnsDialerCandidate
+		bestAnyCandidate       *dnsDialerCandidate
 	)
 	// Get the min latency path.
 	networkType := dialer.NetworkType{
@@ -2875,6 +2936,18 @@ func (c *ControlPlane) chooseBestDnsDialerSnapshot(
 				},
 				latency: latency,
 			}
+			// DNS eligibility gate. The UDP leg selects from the DNS-UDP
+			// class, which the transactional evidence ring evicts directly;
+			// the TCP leg selects from the shared TCP class, where a node
+			// whose generic TCP health is fine would keep winning the DNS
+			// dial argument forever while its DNS path fails (the production
+			// livelock). Require the same dialer's DNS-domain aliveness for
+			// every leg; when no candidate passes the gate, fall back to the
+			// ungated best rather than failing the upstream outright.
+			if !d.MustGetAlive(dnsEvidenceNetworkType(candidate.dialArg)) {
+				bestAnyCandidate = pickBetterDnsDialerCandidate(bestAnyCandidate, candidate)
+				continue
+			}
 			if c.isDnsDialArgPenalized(candidate.dialArg, now) {
 				bestPenalizedCandidate = pickBetterDnsDialerCandidate(bestPenalizedCandidate, candidate)
 				continue
@@ -2885,7 +2958,7 @@ func (c *ControlPlane) chooseBestDnsDialerSnapshot(
 			}
 		}
 	}
-	selectedCandidate, selectedPenalized := chooseDnsDialerCandidate(bestCandidate, bestPenalizedCandidate)
+	selectedCandidate, selectedPenalized := chooseGatedDnsDialerCandidate(bestCandidate, bestPenalizedCandidate, bestAnyCandidate)
 	if selectedCandidate == nil || selectedCandidate.dialArg == nil {
 		return nil, fmt.Errorf("no proper dialer for DNS upstream: %v", dnsUpstream.String())
 	}

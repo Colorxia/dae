@@ -131,3 +131,43 @@ QUIC), and re-routed over the same rule set with the sniffed domain.
 Non-whitelisted traffic of that device still lands on the fallback, relayed
 through userspace. Requires sniffing to be enabled (`sniffing_timeout > 0`,
 `dial_mode != ip`); disable with `auto_sniff_punt: false`.
+
+## SNI learning cache (sni_learning)
+
+The sniff-punt mechanism above punts **every** connection without domain
+knowledge to userspace for a re-sniff. SNI learning removes the repeated cost:
+after a successful TLS ClientHello sniff, dae remembers "this destination IP
+served that domain" in a kernel-side fallback map, and later connections to
+the same IP can be routed by the domain rules directly in the kernel. The
+first connection to an unknown IP always pays the real sniff; learned entries
+expire after `sni_learning_ttl` (default `300s`, range `30s`-`3600s`).
+
+Safety properties worth knowing:
+
+- **DNS stays authoritative.** The learned fallback is consulted only where
+  the DNS-derived domain knowledge misses, so it never overrides what DNS
+  says.
+- **No terminal verdicts by default.** Bits whose rules resolve to
+  `direct`/`block` are not projected, because those verdicts are final in the
+  kernel and a mis-learned domain on a shared IP (CDN) could not self-correct.
+  The default worst case is a connection being routed to a user-defined group.
+  Set `sni_learning_direct: true` to opt in to kernel-decided direct/block for
+  learned domains, accepting that shared-IP boundary.
+- **Threat model.** SNI is a client-asserted field: a LAN host can poison the
+  cache for an IP other clients visit, within the TTL window. The exposure is
+  limited to routing (choosing among configured groups); mitigation is the
+  short TTL plus the no-terminal-verdict default above.
+
+Requires sniffing to be enabled (`sniffing_timeout > 0`, `dial_mode != ip`)
+and at least one `domain` condition in the routing section; otherwise the
+feature stays inert. Disable with `sni_learning: false`.
+
+On top of the kernel-side projection, a destination IP with exactly one
+freshly learned domain also skips the sniff itself: the connection dials
+straight to the cached domain instead of waiting for a ClientHello parse.
+One connection per learned domain every 30 seconds still pays the real
+sniff, so the knowledge stays fresh, sibling domains sharing the IP turn
+the shortcut off again, and a domain whose routing resolves to
+direct/block is never adopted as a dial target. If a domain changes on a
+shared IP within that window the failure is a visible certificate
+mismatch that self-heals at the next sample.

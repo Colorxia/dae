@@ -44,11 +44,18 @@ func shouldTryRawUDPFallback(err error, from, realTo netip.AddrPort) bool {
 	if stderrors.Is(err, unix.EADDRINUSE) || stderrors.Is(err, unix.EADDRNOTAVAIL) {
 		return true
 	}
+	// EINVAL is what the kernel returns when the bind address cannot be used as
+	// a source for this destination, e.g. a loopback bind address writing to a
+	// non-loopback client. That is exactly the case this fallback exists for.
+	if stderrors.Is(err, unix.EINVAL) {
+		return true
+	}
 	// Some net stack paths wrap errno and lose Is(err, errno) matching.
 	// Match common bind/send failures conservatively.
 	errStr := strings.ToLower(err.Error())
 	return strings.Contains(errStr, "address already in use") ||
-		strings.Contains(errStr, "cannot assign requested address")
+		strings.Contains(errStr, "cannot assign requested address") ||
+		strings.Contains(errStr, "sendto: invalid argument")
 }
 
 func tryRawUDPFallback(log *logrus.Logger, data []byte, from, realTo netip.AddrPort, soMark uint32, debugEnabled, errorEnabled bool, reason string, err error) bool {
@@ -199,6 +206,15 @@ type DialOption struct {
 	// NowNano is an optional pre-calculated timestamp to avoid calling time.Now()
 	// in the hot path. If 0, time.Now() will be used.
 	NowNano int64
+}
+
+// dnsFastPathPermitted reports whether port-53 traffic may be absorbed into
+// the DNS controller. A must_rules verdict (Must > 0) reserves the flow for
+// the routing result's outbound: the kernel already decided, and userspace
+// must forward the flow as plain traffic, matching the pre-fast-path
+// semantics where Must forces isDns=false.
+func dnsFastPathPermitted(routingResult *bpfRoutingResult) bool {
+	return routingResult == nil || routingResult.Must == 0
 }
 
 func ChooseNatTimeout(data []byte, sniffDns bool) (dmsg *dnsmessage.Msg, timeout time.Duration) {
@@ -406,6 +422,7 @@ func sendPktWithResponseConnSlot(log *logrus.Logger, data []byte, from netip.Add
 		}
 		if errorEnabled {
 			log.WithFields(logrus.Fields{
+				"bind_addr":  bindAddr.String(),
 				"write_addr": writeAddr.String(),
 				"data_size":  len(data),
 				"error":      err.Error(),
@@ -630,10 +647,11 @@ func (c *ControlPlane) handlePktOwned(data []byte, src, realDst netip.AddrPort, 
 		forceSymmetricKey = udpRouteScopeNeedsDestinationAffinity(routingResult)
 	}
 
-	// DNS to port 53 never reaches this point in production: the ingress
-	// task intercepts valid DNS messages and answers them before calling
-	// into the handlePkt chain (see udp_ingress_task.go). Port-53 packets
-	// that are not valid DNS simply take the normal UDP path below.
+	// Valid DNS to port 53 is answered by the ingress fast path before it
+	// reaches here, unless the routing verdict carries must (see
+	// dnsFastPathPermitted). Those flows are ordinary UDP: the kernel already
+	// chose the outbound, and userspace must not absorb them into the DNS
+	// controller. Port-53 packets that are not valid DNS also take this path.
 
 	var ue *UdpEndpoint
 	var ueExists bool
